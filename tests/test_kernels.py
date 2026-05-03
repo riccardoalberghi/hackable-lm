@@ -45,7 +45,9 @@ def test_fp8_policy_keeps_lm_head_bf16_linear() -> None:
     finally:
         fp8.fp8_cuda_supported = original_supported
 
-    assert isinstance(model.blocks[0].attn.qkv_proj, fp8.Float8Linear)
+    assert isinstance(model.blocks[0].attn.q_proj, fp8.Float8Linear)
+    assert isinstance(model.blocks[0].attn.k_proj, fp8.Float8Linear)
+    assert isinstance(model.blocks[0].attn.v_proj, fp8.Float8Linear)
     assert not isinstance(model.lm_head, fp8.Float8Linear)
 
 

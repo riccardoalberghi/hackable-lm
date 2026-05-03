@@ -31,15 +31,23 @@ def test_optimizer_resume_muon_state_device() -> None:
     loss.backward()
     opt.step()
     state = opt.state_dict()
-    moved_state = {"muon_state": {}, **{k: v for k, v in state.items() if k != "muon_state"}}
-    for name, param_state in state["muon_state"].items():
-        moved_state["muon_state"][name] = {
-            key: value.cpu() if torch.is_tensor(value) else value for key, value in param_state.items()
-        }
+    moved_state = {
+        "state": {
+            key: {state_key: value.cpu() if torch.is_tensor(value) else value for state_key, value in param_state.items()}
+            for key, param_state in state["state"].items()
+        },
+        "param_groups": state["param_groups"],
+    }
     resumed_model = LanguageModel(cfg.model).to(device)
     resumed_opt = create_optimizer(resumed_model, cfg)
     resumed_opt.load_state_dict(moved_state)
-    assert all(param_state["momentum_buffer"].device.type == device.type for param_state in resumed_opt.muon_state.values())
+    muon_states = [
+        resumed_opt.state[group["params"][0]]
+        for group in resumed_opt.param_groups
+        if group["kind"] == "muon" and group["params"] and "momentum_buffer" in resumed_opt.state[group["params"][0]]
+    ]
+    assert muon_states
+    assert all(param_state["momentum_buffer"].device.type == device.type for param_state in muon_states)
     resumed_opt.zero_grad(set_to_none=True)
     _, resumed_loss = resumed_model(x, x)
     resumed_loss.backward()

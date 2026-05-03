@@ -70,7 +70,9 @@ def test_model_initialization_is_gpt_style() -> None:
 
     assert_std_close(model.tok_emb.weight, base_std)
     assert_std_close(model.lm_head.weight, base_std)
-    assert_std_close(model.blocks[0].attn.qkv_proj.weight, base_std)
+    assert_std_close(model.blocks[0].attn.q_proj.weight, base_std)
+    assert_std_close(model.blocks[0].attn.k_proj.weight, base_std)
+    assert_std_close(model.blocks[0].attn.v_proj.weight, base_std)
     assert_std_close(model.blocks[0].mlp.gate_proj.weight, base_std)
     assert_std_close(model.blocks[0].mlp.up_proj.weight, base_std)
     assert_std_close(model.blocks[0].attn.o_proj.weight, residual_std)

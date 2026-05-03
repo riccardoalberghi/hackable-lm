@@ -79,7 +79,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.attention_window = layer_attention_window(layer_idx, config.n_layer, config.attention_window, config.attention_full_every)
         self.dropout = config.dropout
-        self.qkv_proj = Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * config.head_dim, bias=False)
+        self.q_proj = Linear(config.n_embd, config.n_head * config.head_dim, bias=False)
+        self.k_proj = Linear(config.n_embd, config.n_kv_head * config.head_dim, bias=False)
+        self.v_proj = Linear(config.n_embd, config.n_kv_head * config.head_dim, bias=False)
         self.o_proj = Linear(config.n_head * config.head_dim, config.n_embd, bias=False)
         self.q_norm = RMSNorm(config.head_dim, config.norm_eps) if config.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(config.head_dim, config.norm_eps) if config.qk_norm else nn.Identity()
@@ -107,9 +109,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
-        q_size = self.n_head * self.head_dim
-        kv_size = self.n_kv_head * self.head_dim
-        q, k, v = self.qkv_proj(x).split((q_size, kv_size, kv_size), dim=-1)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
         q = q.view(bsz, seq_len, self.n_head, self.head_dim)
         k = k.view(bsz, seq_len, self.n_kv_head, self.head_dim)
         v = v.view(bsz, seq_len, self.n_kv_head, self.head_dim)
