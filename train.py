@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from config import COMPARISON_MODES, DEFAULTS, L40_FP8_DENSE_PEAK, resolve_config
+from config import COMPARISON_MODES, DEFAULTS, L40_BF16_DENSE_PEAK, L40_FP8_DENSE_PEAK, resolve_config
 from data import MemmapDataLoader, load_manifest
 from kernels import apply_precision_policy, compile_training_model, mark_compiled_step_begin, resolve_kernel_backends
 from model import LanguageModel
@@ -478,6 +478,7 @@ def main() -> None:
                 tokens_sec = config.global_batch_tokens * args.log_interval / elapsed if step != start_step else 0.0
                 last_time = now
                 train_loss = float((total_loss / config.gradient_accumulation_steps).item())
+                model_flops_sec = config.estimated_flops_per_token * tokens_sec if tokens_sec else 0.0
                 record = {
                     "step": step,
                     "loss": train_loss,
@@ -492,7 +493,10 @@ def main() -> None:
                     "grad_norm": float(grad_norm),
                     "tokens_seen": tokens_seen,
                     "tokens_sec": tokens_sec,
-                    "mfu": config.estimated_flops_per_token * tokens_sec / L40_FP8_DENSE_PEAK if tokens_sec else 0.0,
+                    "model_flops_sec": model_flops_sec,
+                    "mfu": model_flops_sec / L40_BF16_DENSE_PEAK if model_flops_sec else 0.0,
+                    "bf16_mfu": model_flops_sec / L40_BF16_DENSE_PEAK if model_flops_sec else 0.0,
+                    "fp8_peak_util": model_flops_sec / L40_FP8_DENSE_PEAK if model_flops_sec else 0.0,
                     "peak_memory": torch.cuda.max_memory_allocated(),
                     "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3,
                     "reserved_memory": torch.cuda.max_memory_reserved(),

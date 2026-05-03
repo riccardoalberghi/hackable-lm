@@ -612,6 +612,8 @@ Muon momentum
 weight decay
 tokens/sec
 MFU
+BF16 MFU
+FP8 peak utilization
 peak memory
 precision mode
 kernel backends actually used
@@ -950,8 +952,14 @@ L40_FP8_DENSE_PEAK = 362e12
 MFU estimate:
 
 ```python
-mfu = flops_per_token * tokens_per_second / peak_flops
+model_flops_sec = flops_per_token * tokens_per_second
+mfu = model_flops_sec / L40_BF16_DENSE_PEAK
+bf16_mfu = mfu
+fp8_peak_util = model_flops_sec / L40_FP8_DENSE_PEAK
 ```
+
+Keep `mfu` on the common BF16-peak convention, including FP8 runs. Report the
+stricter FP8 denominator separately as `fp8_peak_util`.
 
 ## Evaluation
 

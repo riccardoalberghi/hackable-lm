@@ -108,6 +108,10 @@ steps = target_tokens // global_batch_tokens
 Every run manifest records the resolved `shape_policy`, `budget_policy`,
 `comparison_mode`, scheduled tokens, and train FLOPs budget.
 
+Training logs keep `mfu` on the standard BF16-peak denominator so FP8 and BF16
+runs are comparable by the usual convention. FP8-denominator utilization is
+reported separately as `fp8_peak_util`.
+
 ## Baseline Contract
 
 Primary metric: validation loss on the processed pretraining validation memmap.
