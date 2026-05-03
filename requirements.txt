@@ -8,3 +8,4 @@ tqdm
 datasets
 lm-eval
 mlflow
+pytest

@@ -94,7 +94,7 @@ eval.py
 eval_tasks.py
 prepare_eval.py
 triton_kernels/
-tests.py
+tests/
 AGENTS.md
 requirements.txt
 README.md
@@ -1047,8 +1047,10 @@ for correctness testing only. They are not training backends.
 The basic test command should be:
 
 ```bash
-python tests.py
+pytest
 ```
+
+On machines without CUDA, use `pytest -m "not cuda"` for portable smoke tests.
 
 ## Implementation Priority
 
@@ -1063,7 +1065,7 @@ P0: fast-path runnable repo
   prepare_data.py
   optim.py with Muon plus AdamW subgroups
   train.py with fast-path training loop
-  tests.py
+  tests/
   README quickstart
 
 P1: fair comparison and speed defaults

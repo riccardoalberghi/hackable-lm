@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+from config import resolve_config
+from conftest import requires_torch, torch
+
+
+@requires_torch
+def test_model_forward_and_optimizer_grouping() -> None:
+    from model import LanguageModel
+    from optim import create_optimizer
+
+    cfg = resolve_config(
+        depth=5,
+        vocab_size=128,
+        sequence_len=8,
+        attention_window=4,
+        device_batch_size=2,
+        precision="fp32_test",
+        compile_model=False,
+        norm_backend="torch",
+        loss_backend="torch",
+    )
+    model = LanguageModel(cfg.model)
+    assert hasattr(model.blocks[0].mlp, "up_proj")
+    assert hasattr(model.blocks[0].mlp, "gate_proj")
+    assert cfg.model.rope_fraction == 0.25
+    assert model.blocks[0].attn.rope.rotary_dim == cfg.model.head_dim // 4
+    mask = model.blocks[0].attn._sliding_window_mask(cfg.sequence_len, torch.device("cpu"))
+    assert model.blocks[3].attn.attention_window is None
+    assert model.blocks[-1].attn.attention_window is None
+    assert mask is not None
+    assert bool(mask[0, 0, 7, 7])
+    assert bool(mask[0, 0, 7, 4])
+    assert not bool(mask[0, 0, 7, 3])
+    x = torch.randint(0, cfg.model.vocab_size, (2, cfg.sequence_len))
+    logits, loss = model(x, x)
+    assert logits is None
+    assert loss is not None and torch.isfinite(loss)
+    logits, loss = model(x)
+    assert logits.shape == (2, cfg.sequence_len, cfg.model.vocab_size)
+    assert loss is None
+    opt = create_optimizer(model, cfg)
+    summary = opt.summary()
+    assert summary["muon_tensors"] > 0
+    assert summary["adamw_tensors"] > 0
+
+
+@requires_torch
+def test_model_initialization_is_gpt_style() -> None:
+    from model import LanguageModel
+
+    torch.manual_seed(0)
+    cfg = resolve_config(
+        depth=6,
+        vocab_size=512,
+        sequence_len=8,
+        device_batch_size=2,
+        precision="fp32_test",
+        compile_model=False,
+        norm_backend="torch",
+        loss_backend="torch",
+    )
+    model = LanguageModel(cfg.model)
+    base_std = 0.02
+    residual_std = base_std / (2 * cfg.model.n_layer) ** 0.5
+
+    def assert_std_close(param: torch.Tensor, expected: float) -> None:
+        actual = float(param.detach().float().std(unbiased=False))
+        assert abs(actual - expected) / expected < 0.12, (actual, expected)
+
+    assert_std_close(model.tok_emb.weight, base_std)
+    assert_std_close(model.lm_head.weight, base_std)
+    assert_std_close(model.blocks[0].attn.qkv_proj.weight, base_std)
+    assert_std_close(model.blocks[0].mlp.gate_proj.weight, base_std)
+    assert_std_close(model.blocks[0].mlp.up_proj.weight, base_std)
+    assert_std_close(model.blocks[0].attn.o_proj.weight, residual_std)
+    assert_std_close(model.blocks[0].mlp.down_proj.weight, residual_std)

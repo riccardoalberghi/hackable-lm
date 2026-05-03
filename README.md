@@ -229,7 +229,7 @@ intentional non-paper debugging.
 - `train.py`: pretraining loop, logging, validation, checkpointing
 - `prepare_eval.py`, `eval_tasks.py`, `eval.py`: local inspectable eval suite
 - `repro.py`: seeds, hashes, environment, manifests, comparison warnings
-- `tests.py`: compact smoke tests
+- `tests/`: pytest smoke tests
 
 ## Offline Operation
 
@@ -249,7 +249,13 @@ the Python wheel/cache dependencies into the runtime environment.
 ## Tests
 
 ```bash
-python tests.py
+pytest
+```
+
+On a non-CUDA machine, run the portable smoke tests only:
+
+```bash
+pytest -m "not cuda"
 ```
 
 Tests use explicit CPU/Torch smoke paths and are not a training fallback.
