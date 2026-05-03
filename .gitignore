@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+.DS_Store
+.venv/
+venv/
+
+data/
+eval_data/
+runs/
+mlruns/
+
+*.pt
+*.pth
+*.bin
+*.safetensors

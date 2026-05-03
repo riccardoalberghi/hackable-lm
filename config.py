@@ -1,0 +1,392 @@
+from __future__ import annotations
+
+import math
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+SCALING_POLICY = "depth_simple"
+COMPARISON_MODES = {"same_depth", "same_params", "same_tokens", "same_bytes", "same_flops", "same_time"}
+
+DEFAULTS = {
+    "head_dim": 128,
+    "layers_per_head": 2,
+    "sequence_len": 2048,
+    "attention_window": 512,
+    "attention_full_every": 4,
+    "target_param_data_ratio": 60,
+    "device_batch_size": 16,
+    "reference_depth": 12,
+    "reference_batch_tokens": 2**19,
+    "embedding_lr_ref": 0.1,
+    "unembedding_lr_ref": 0.01,
+    "matrix_lr_ref": 0.02,
+    "scalar_lr_ref": 0.1,
+    "weight_decay": 0.1,
+    "lr_scheduler": "wsd",
+    "warmup_ratio": 0.05,
+    "warmdown_ratio": 0.3,
+    "final_lr_frac": 0.1,
+    "compile_mode": "default",
+    "compile_capture_scalar_outputs": True,
+    "norm_backend": "torch",
+    "loss_backend": "liger",
+    "loss_chunk_size": 4096,
+}
+
+L40_BF16_DENSE_PEAK = 181e12
+L40_FP8_DENSE_PEAK = 362e12
+
+
+def ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def round_up(x: int, multiple: int) -> int:
+    return ceil_div(x, multiple) * multiple
+
+
+def depth_dimensions(depth: int, head_dim: int = DEFAULTS["head_dim"], layers_per_head: int = DEFAULTS["layers_per_head"]) -> tuple[int, int]:
+    n_head = ceil_div(depth, layers_per_head)
+    n_embd = n_head * head_dim
+    return n_embd, n_head
+
+
+def mlp_hidden_dim(n_embd: int) -> int:
+    return round_up(ceil_div(8 * n_embd, 3), 256)
+
+
+def scaling_params_for_depth(
+    depth: int,
+    vocab_size: int,
+    head_dim: int = DEFAULTS["head_dim"],
+    layers_per_head: int = DEFAULTS["layers_per_head"],
+) -> int:
+    n_embd, _ = depth_dimensions(depth, head_dim, layers_per_head)
+    hidden = mlp_hidden_dim(n_embd)
+    attn_mats = 4 * n_embd * n_embd
+    mlp_mats = 3 * n_embd * hidden
+    lm_head = n_embd * vocab_size
+    return depth * (attn_mats + mlp_mats) + lm_head
+
+
+def depth_for_target_params(target_params: int, vocab_size: int) -> int:
+    hi = 1
+    while scaling_params_for_depth(hi, vocab_size) < target_params:
+        hi *= 2
+    lo = max(1, hi // 2)
+    return min(range(lo, hi + 1), key=lambda d: abs(scaling_params_for_depth(d, vocab_size) - target_params))
+
+
+def normalize_attention_window(attention_window: int | None) -> int | None:
+    if attention_window is None or attention_window == 0:
+        return None
+    return int(attention_window)
+
+
+def normalize_attention_full_every(attention_full_every: int | None) -> int | None:
+    if attention_full_every is None or attention_full_every == 0:
+        return None
+    return int(attention_full_every)
+
+
+def layer_attention_window(layer_idx: int, n_layer: int, attention_window: int | None, attention_full_every: int | None) -> int | None:
+    if attention_window is None:
+        return None
+    if layer_idx == n_layer - 1:
+        return None
+    if attention_full_every is not None and (layer_idx + 1) % attention_full_every == 0:
+        return None
+    return attention_window
+
+
+def estimate_flops_per_token(
+    depth: int,
+    n_embd: int,
+    seq_len: int,
+    scaling_params: int,
+    attention_window: int | None = None,
+    attention_full_every: int | None = None,
+) -> int:
+    attn_flops = 0
+    for layer_idx in range(depth):
+        layer_window = layer_attention_window(layer_idx, depth, attention_window, attention_full_every)
+        effective_context = seq_len if layer_window is None else min(seq_len, layer_window)
+        attn_flops += 12 * effective_context * n_embd
+    return int(6 * scaling_params + attn_flops)
+
+
+@dataclass
+class ModelConfig:
+    """Decoder-only baseline: RoPE, pre-norm RMSNorm, QK norm, SwiGLU MLP, untied head."""
+
+    vocab_size: int
+    block_size: int
+    n_layer: int
+    n_embd: int
+    n_head: int
+    n_kv_head: int
+    head_dim: int = DEFAULTS["head_dim"]
+    mlp_hidden: int = 0
+    rope_theta: float = 1_000_000.0
+    rope_fraction: float = 0.25
+    norm_eps: float = 1e-6
+    dropout: float = 0.0
+    tie_embeddings: bool = False
+    qk_norm: bool = True
+    attention_window: int | None = DEFAULTS["attention_window"]
+    attention_full_every: int | None = DEFAULTS["attention_full_every"]
+    attention_backend: str = "flash_attn_2"
+    norm_backend: str = DEFAULTS["norm_backend"]
+    loss_backend: str = DEFAULTS["loss_backend"]
+    loss_chunk_size: int = DEFAULTS["loss_chunk_size"]
+    rope_backend: str = "torch"
+
+
+@dataclass
+class ResolvedConfig:
+    depth: int
+    scaling_policy: str
+    model: ModelConfig
+    sequence_len: int
+    scaling_params: int
+    target_tokens: int
+    reference_depth: int
+    reference_batch_tokens: int
+    predicted_batch_tokens: int
+    global_batch_tokens: int
+    requested_global_batch_tokens: int | None
+    device_batch_size: int
+    gradient_accumulation_steps: int
+    total_gradient_accumulation_steps: int
+    world_size: int
+    batch_lr_scale: float
+    embedding_lr: float
+    unembedding_lr: float
+    matrix_lr: float
+    scalar_lr: float
+    weight_decay: float
+    warmup_ratio: float
+    warmup_steps: int
+    warmdown_ratio: float
+    final_lr_frac: float
+    num_iterations: int
+    estimated_flops_per_token: int
+    lr_scheduler: str = DEFAULTS["lr_scheduler"]
+    target_flops: float | None = None
+    precision: str = "fp8"
+    compile: bool = True
+    compile_mode: str = DEFAULTS["compile_mode"]
+    compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"]
+    kernel_backend: str = "torch"
+    shape_policy: str = "depth"
+    budget_policy: str = "param_data_ratio"
+    comparison_mode: str = "same_depth"
+    requested_depth: int | None = None
+    requested_target_params: int | None = None
+    target_bytes: int | None = None
+    bytes_per_token: float | None = None
+    target_time_seconds: float | None = None
+    tokens_per_second: float | None = None
+    target_param_data_ratio: int = DEFAULTS["target_param_data_ratio"]
+    scheduled_tokens: int = 0
+    train_flops_budget: float = 0.0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def resolve_config(
+    *,
+    depth: int | None,
+    vocab_size: int = 32768,
+    sequence_len: int = DEFAULTS["sequence_len"],
+    attention_window: int | None = DEFAULTS["attention_window"],
+    attention_full_every: int | None = DEFAULTS["attention_full_every"],
+    target_param_data_ratio: int = DEFAULTS["target_param_data_ratio"],
+    target_params: int | None = None,
+    target_tokens: int | None = None,
+    target_bytes: int | None = None,
+    bytes_per_token: float | None = None,
+    global_batch_tokens: int | None = None,
+    device_batch_size: int = DEFAULTS["device_batch_size"],
+    num_iterations: int | None = None,
+    target_flops: float | None = None,
+    target_time_seconds: float | None = None,
+    tokens_per_second: float | None = None,
+    precision: str = "fp8",
+    compile_model: bool = True,
+    compile_mode: str = DEFAULTS["compile_mode"],
+    compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"],
+    kernel_backend: str = "torch",
+    norm_backend: str = DEFAULTS["norm_backend"],
+    loss_backend: str = DEFAULTS["loss_backend"],
+    comparison_mode: str = "same_depth",
+) -> ResolvedConfig:
+    if comparison_mode not in COMPARISON_MODES:
+        raise ValueError(f"unknown comparison mode {comparison_mode!r}")
+    attention_window = normalize_attention_window(attention_window)
+    attention_full_every = normalize_attention_full_every(attention_full_every)
+    if compile_mode not in {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}:
+        raise ValueError(f"unknown compile mode {compile_mode!r}")
+    if kernel_backend != "torch":
+        raise ValueError(f"unknown kernel backend {kernel_backend!r}")
+    if norm_backend != "torch":
+        raise ValueError(f"unknown norm backend {norm_backend!r}")
+    if loss_backend not in {"torch", "liger"}:
+        raise ValueError(f"unknown loss backend {loss_backend!r}")
+    budget_overrides = [num_iterations, target_tokens, target_bytes, target_flops, target_time_seconds]
+    if sum(value is not None for value in budget_overrides) > 1:
+        raise ValueError("choose only one budget override: num_iterations, target_tokens, target_bytes, target_flops, or target_time_seconds")
+
+    requested_depth = depth
+    if target_params is not None:
+        depth = depth_for_target_params(target_params, vocab_size)
+        shape_policy = "target_params"
+    elif depth is None:
+        raise ValueError("depth is required unless target_params is provided")
+    else:
+        shape_policy = "depth"
+
+    n_embd, n_head = depth_dimensions(depth)
+    hidden = mlp_hidden_dim(n_embd)
+    scaling_params = scaling_params_for_depth(depth, vocab_size)
+    param_ratio_target_tokens = int(target_param_data_ratio * scaling_params)
+    resolved_target_tokens = param_ratio_target_tokens
+    budget_policy = "param_data_ratio"
+    if target_tokens is not None:
+        resolved_target_tokens = int(target_tokens)
+        budget_policy = "fixed_tokens"
+    elif target_bytes is not None:
+        resolved_target_tokens = int(target_bytes / bytes_per_token)
+        budget_policy = "fixed_bytes"
+    elif target_time_seconds is not None:
+        resolved_target_tokens = int(target_time_seconds * tokens_per_second)
+        budget_policy = "fixed_time_estimate"
+    elif target_flops is not None:
+        budget_policy = "fixed_flops"
+    elif num_iterations is not None:
+        budget_policy = "fixed_steps"
+
+    batch_depth_scale = math.sqrt(depth / DEFAULTS["reference_depth"])
+    predicted_batch_tokens = max(1, round(DEFAULTS["reference_batch_tokens"] * batch_depth_scale))
+    requested_global = global_batch_tokens
+    nominal_global = global_batch_tokens or predicted_batch_tokens
+    micro_tokens = device_batch_size * sequence_len
+    grad_accum = max(1, ceil_div(nominal_global, micro_tokens))
+    actual_global = grad_accum * micro_tokens
+
+    batch_lr_scale = math.sqrt(actual_global / DEFAULTS["reference_batch_tokens"])
+    embedding_lr = DEFAULTS["embedding_lr_ref"] * batch_lr_scale
+    unembedding_lr = DEFAULTS["unembedding_lr_ref"] * batch_lr_scale
+    matrix_lr = DEFAULTS["matrix_lr_ref"] * batch_lr_scale
+    scalar_lr = DEFAULTS["scalar_lr_ref"] * batch_lr_scale
+    weight_decay = DEFAULTS["weight_decay"]
+
+    flops_per_token = estimate_flops_per_token(depth, n_embd, sequence_len, scaling_params, attention_window, attention_full_every)
+    if num_iterations is not None:
+        steps = int(num_iterations)
+    elif target_flops is not None:
+        steps = round(target_flops / (flops_per_token * actual_global))
+    else:
+        steps = resolved_target_tokens // actual_global
+    warmup_steps = max(1, round(DEFAULTS["warmup_ratio"] * steps)) if steps > 0 else 0
+    scheduled_tokens = steps * actual_global
+    train_flops_budget = float(flops_per_token * scheduled_tokens)
+
+    model = ModelConfig(
+        vocab_size=vocab_size,
+        block_size=sequence_len,
+        n_layer=depth,
+        n_embd=n_embd,
+        n_head=n_head,
+        n_kv_head=n_head,
+        mlp_hidden=hidden,
+        attention_window=attention_window,
+        attention_full_every=attention_full_every,
+        attention_backend="flash_attn_2",
+        norm_backend=norm_backend,
+        loss_backend=loss_backend,
+        loss_chunk_size=DEFAULTS["loss_chunk_size"],
+    )
+
+    return ResolvedConfig(
+        depth=depth,
+        scaling_policy=SCALING_POLICY,
+        model=model,
+        sequence_len=sequence_len,
+        scaling_params=scaling_params,
+        target_tokens=resolved_target_tokens,
+        reference_depth=DEFAULTS["reference_depth"],
+        reference_batch_tokens=DEFAULTS["reference_batch_tokens"],
+        predicted_batch_tokens=predicted_batch_tokens,
+        global_batch_tokens=actual_global,
+        requested_global_batch_tokens=requested_global,
+        device_batch_size=device_batch_size,
+        gradient_accumulation_steps=grad_accum,
+        total_gradient_accumulation_steps=grad_accum,
+        world_size=1,
+        batch_lr_scale=batch_lr_scale,
+        embedding_lr=embedding_lr,
+        unembedding_lr=unembedding_lr,
+        matrix_lr=matrix_lr,
+        scalar_lr=scalar_lr,
+        weight_decay=weight_decay,
+        lr_scheduler=DEFAULTS["lr_scheduler"],
+        warmup_ratio=DEFAULTS["warmup_ratio"],
+        warmup_steps=warmup_steps,
+        warmdown_ratio=DEFAULTS["warmdown_ratio"],
+        final_lr_frac=DEFAULTS["final_lr_frac"],
+        num_iterations=steps,
+        estimated_flops_per_token=flops_per_token,
+        target_flops=target_flops,
+        precision=precision,
+        compile=compile_model,
+        compile_mode=compile_mode,
+        compile_capture_scalar_outputs=compile_capture_scalar_outputs,
+        kernel_backend=kernel_backend,
+        shape_policy=shape_policy,
+        budget_policy=budget_policy,
+        comparison_mode=comparison_mode,
+        requested_depth=requested_depth,
+        requested_target_params=target_params,
+        target_bytes=target_bytes,
+        bytes_per_token=bytes_per_token,
+        target_time_seconds=target_time_seconds,
+        tokens_per_second=tokens_per_second,
+        target_param_data_ratio=target_param_data_ratio,
+        scheduled_tokens=scheduled_tokens,
+        train_flops_budget=train_flops_budget,
+    )
+
+
+def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
+    data = dict(obj)
+    old_ref_depth = data.pop("D_REF", None)
+    old_ref_batch = data.pop("B_REF", None)
+    data.pop("dmodel_lr_scale", None)
+    data.setdefault(
+        "reference_depth",
+        old_ref_depth if isinstance(old_ref_depth, int) and old_ref_depth < 10_000 else DEFAULTS["reference_depth"],
+    )
+    data.setdefault("reference_batch_tokens", old_ref_batch or DEFAULTS["reference_batch_tokens"])
+    data.setdefault("lr_scheduler", DEFAULTS["lr_scheduler"])
+    data.setdefault("total_gradient_accumulation_steps", data["gradient_accumulation_steps"])
+    data.setdefault("world_size", 1)
+    model_data = dict(data["model"])
+    if "attention_window" not in model_data:
+        model_data["attention_window"] = None
+    if "attention_full_every" not in model_data:
+        model_data["attention_full_every"] = None
+    model_data.setdefault("rope_fraction", 0.25)
+    model_data.pop("mlp_activation", None)
+    model_data.pop("mlp_backend", None)
+    model_data["norm_backend"] = "torch"
+    model_data.setdefault("loss_backend", DEFAULTS["loss_backend"])
+    model_data.setdefault("loss_chunk_size", DEFAULTS["loss_chunk_size"])
+    model_data["attention_window"] = normalize_attention_window(model_data["attention_window"])
+    model_data["attention_full_every"] = normalize_attention_full_every(model_data["attention_full_every"])
+    data["kernel_backend"] = "torch"
+    data["model"] = ModelConfig(**model_data)
+    return ResolvedConfig(**data)

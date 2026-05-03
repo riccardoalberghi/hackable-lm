@@ -1,0 +1,10 @@
+torch
+numpy
+tokenizers
+flash-attn
+triton
+liger-kernel
+tqdm
+datasets
+lm-eval
+mlflow
