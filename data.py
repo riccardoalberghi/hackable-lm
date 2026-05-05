@@ -90,8 +90,8 @@ class CudaBatchPrefetcher:
         ]
         self.cpu_numpy_views = [(buffer[0].numpy(), buffer[1].numpy()) for buffer in self.cpu_buffers]
         self.gpu_buffers = [
-            torch.empty_like(buffer, device=device),
-            torch.empty_like(buffer, device=device),
+            torch.empty_like(self.cpu_buffers[0], device=device),
+            torch.empty_like(self.cpu_buffers[1], device=device),
         ]
         self.ready_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.ready_recorded = [False, False]

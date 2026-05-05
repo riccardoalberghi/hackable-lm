@@ -21,16 +21,12 @@ def test_config_derivation() -> None:
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
     assert DEFAULTS["lr_depth_stability_reference"] == 6
-    assert DEFAULTS["norm_backend"] == "liger"
-    assert DEFAULTS["mlp_backend"] == "liger"
     assert DEFAULTS["loss_backend"] == "liger"
     assert DEFAULTS["rope_backend"] == "torch"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
-    assert default_cfg.model.norm_backend == "liger"
-    assert default_cfg.model.mlp_backend == "liger"
     assert default_cfg.model.loss_backend == "liger"
     assert default_cfg.model.rope_backend == "torch"
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
@@ -53,14 +49,11 @@ def test_config_derivation() -> None:
     legacy_style = cfg.to_dict()
     legacy_style["model"].pop("loss_backend")
     assert config_from_dict(legacy_style).model.loss_backend == DEFAULTS["loss_backend"]
-    legacy_style = cfg.to_dict()
-    legacy_style["model"].pop("mlp_backend")
-    assert config_from_dict(legacy_style).model.mlp_backend == DEFAULTS["mlp_backend"]
     stale_mlp_style = cfg.to_dict()
     stale_mlp_style["model"]["mlp_activation"] = "legacy"
     assert not hasattr(config_from_dict(stale_mlp_style).model, "mlp_activation")
-    triton_rope = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="triton_qk_norm_rope")
-    assert triton_rope.model.rope_backend == "triton_qk_norm_rope"
+    triton_rope = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="triton")
+    assert triton_rope.model.rope_backend == "triton"
 
 
 def test_config_shape_and_budget_controls() -> None:

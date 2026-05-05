@@ -17,8 +17,6 @@ def test_model_forward_and_optimizer_grouping() -> None:
         device_batch_size=2,
         precision="fp32_test",
         compile_model=False,
-        norm_backend="torch",
-        mlp_backend="torch",
         loss_backend="torch",
     )
     model = LanguageModel(cfg.model)
@@ -67,8 +65,6 @@ def test_model_initialization_is_gpt_style() -> None:
         device_batch_size=2,
         precision="fp32_test",
         compile_model=False,
-        norm_backend="torch",
-        mlp_backend="torch",
         loss_backend="torch",
     )
     model = LanguageModel(cfg.model)

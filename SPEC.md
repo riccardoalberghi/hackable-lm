@@ -63,9 +63,9 @@ The normal runtime target is:
 device: CUDA
 precision: bf16
 optimizer: muon, with AdamW groups for parameters where Muon is inappropriate
-norm kernels: Liger RMSNorm
-lm-head + cross entropy: Liger fused linear CE
-MLP nonlinear kernels: Liger SwiGLU
+norm kernels: torch.compile RMSNorm
+lm-head + cross entropy: compile-visible Triton wrapper around Liger CE
+MLP nonlinear kernels: torch.compile SwiGLU
 compile: true
 ```
 
@@ -459,11 +459,10 @@ precision = "bf16"
 ```
 
 Keep model parameters in bf16 for the CUDA training hot path, without separate
-FP32 master weights. Use Liger kernels for eligible fused operations:
+FP32 master weights. Let `torch.compile` handle RMSNorm and SwiGLU, and use a
+compile-visible Triton wrapper around Liger's CE kernel for the fused loss path:
 
 ```text
-RMSNorm
-SwiGLU activation and multiply
 LM head plus cross entropy
 ```
 
@@ -869,7 +868,7 @@ Default performance features:
 - `torch.compile` behind a config flag, default true for train
 - fast attention backend where available
 - bf16 model compute by default
-- Liger RMSNorm, SwiGLU, and fused linear CE by default
+- torch.compile RMSNorm/SwiGLU and standard Liger linear CE by default
 - fixed static sequence length
 - tensor-core-friendly dimensions
 
@@ -902,11 +901,9 @@ combination.
 Use Liger kernels through `kernels.py` for operations where this repo has a
 direct compatible call site.
 
-Liger backends should be behind explicit config values:
+The Liger-backed fused linear CE loss should be behind an explicit config value:
 
 ```python
-norm_backend = "liger"
-mlp_backend = "liger"
 loss_backend = "liger"
 ```
 

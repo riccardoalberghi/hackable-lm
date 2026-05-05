@@ -38,8 +38,6 @@ class KernelInfo:
 
 _FLASH_ATTN = None
 _LIGER_FUSED_LINEAR_CE = None
-_LIGER_RMS_NORM = None
-_LIGER_SWIGLU = None
 
 
 def liger_available() -> bool:
@@ -73,24 +71,6 @@ def _liger_fused_linear_ce():
 
         _LIGER_FUSED_LINEAR_CE = LigerFusedLinearCrossEntropyLoss(reduction="mean")
     return _LIGER_FUSED_LINEAR_CE
-
-
-def _liger_rms_norm():
-    global _LIGER_RMS_NORM
-    if _LIGER_RMS_NORM is None:
-        from liger_kernel.transformers.functional import liger_rms_norm
-
-        _LIGER_RMS_NORM = liger_rms_norm
-    return _LIGER_RMS_NORM
-
-
-def _liger_swiglu():
-    global _LIGER_SWIGLU
-    if _LIGER_SWIGLU is None:
-        from liger_kernel.transformers.functional import liger_swiglu
-
-        _LIGER_SWIGLU = liger_swiglu
-    return _LIGER_SWIGLU
 
 
 def _import_flash_attn():
@@ -136,8 +116,6 @@ def resolve_kernel_backends(
     compile_model: bool,
     compile_mode: str = "default",
     compile_capture_scalar_outputs: bool = True,
-    norm_backend: str = "torch",
-    mlp_backend: str = "torch",
     loss_backend: str = "torch",
     rope_backend: str = "torch",
     allow_torch_backend: bool = False,
@@ -145,17 +123,11 @@ def resolve_kernel_backends(
     requested = requested.lower()
     if requested != "torch":
         raise ValueError(f"unknown kernel backend {requested!r}")
-    norm_backend = norm_backend.lower()
-    if norm_backend not in {"torch", "liger"}:
-        raise ValueError(f"unknown norm backend {norm_backend!r}")
-    mlp_backend = mlp_backend.lower()
-    if mlp_backend not in {"torch", "liger"}:
-        raise ValueError(f"unknown MLP backend {mlp_backend!r}")
     loss_backend = loss_backend.lower()
     if loss_backend not in {"torch", "liger"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
     rope_backend = rope_backend.lower()
-    if rope_backend not in {"torch", "triton_qk_norm_rope"}:
+    if rope_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown RoPE backend {rope_backend!r}")
     flash_attn = _import_flash_attn()
     has_liger = liger_available()
@@ -169,25 +141,23 @@ def resolve_kernel_backends(
         raise RuntimeError(
             f"unsupported precision mode {precision!r}; the training fast path uses bf16"
         )
-    if (
-        norm_backend == "liger" or mlp_backend == "liger" or loss_backend == "liger"
-    ) and not has_liger and not allow_torch_backend:
+    if loss_backend == "liger" and not has_liger and not allow_torch_backend:
         raise RuntimeError(
             "A Liger backend was requested but liger-kernel is not importable. "
             "Run `uv sync --locked` in the CUDA environment."
         )
-    if rope_backend == "triton_qk_norm_rope" and not has_triton and not allow_torch_backend:
+    if rope_backend == "triton" and not has_triton and not allow_torch_backend:
         raise RuntimeError(
-            "rope_backend=triton_qk_norm_rope requires Triton. "
+            "rope_backend=triton requires Triton. "
             "Run `uv sync --locked` in the CUDA environment."
         )
     return KernelInfo(
         requested_backend=requested,
         actual_attention_backend="flash_attn_2" if flash_attn else "torch_sdpa",
-        actual_norm_backend="liger_rms_norm" if norm_backend == "liger" and has_liger else "torch",
-        actual_mlp_backend="liger_swiglu" if mlp_backend == "liger" and has_liger else "torch",
+        actual_norm_backend="torch",
+        actual_mlp_backend="torch",
         actual_loss_backend="liger_fused_linear_ce" if loss_backend == "liger" and has_liger else "torch",
-        actual_rope_backend="triton_qk_norm_rope" if rope_backend == "triton_qk_norm_rope" and has_triton else "torch",
+        actual_rope_backend="triton" if rope_backend == "triton" and has_triton else "torch",
         torch_compile=compile_model,
         torch_compile_mode=compile_mode,
         torch_compile_capture_scalar_outputs=compile_capture_scalar_outputs,
@@ -198,22 +168,12 @@ def resolve_kernel_backends(
     )
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float, backend: str = "torch") -> torch.Tensor:
-    if backend == "liger":
-        _require_liger("norm_backend=liger")
-        return _liger_rms_norm()(x, weight, eps, in_place=False)
-    if backend != "torch":
-        raise RuntimeError(f"unsupported RMSNorm backend {backend!r}")
+def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
     y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
     return y if weight is None else y * weight
 
 
-def swiglu(gate: torch.Tensor, up: torch.Tensor, backend: str = "torch") -> torch.Tensor:
-    if backend == "liger":
-        _require_liger("mlp_backend=liger")
-        return _liger_swiglu()(gate, up)
-    if backend != "torch":
-        raise RuntimeError(f"unsupported SwiGLU backend {backend!r}")
+def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
@@ -224,206 +184,230 @@ if triton is not None:
         triton.Config({"BLOCK_M": 4}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 8}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 4}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 8}, num_warps=8, num_stages=3),
     ]
 
     @triton.autotune(
         configs=_QK_NORM_ROPE_CONFIGS,
-        key=["T", "N_Q", "N_K", "HEAD_DIM", "ROTARY_DIM"],
+        key=["SEQ_LEN", "Q_HEADS", "K_HEADS", "HEAD_DIM", "ROTARY_DIM"],
     )
     @triton.jit
-    def _qk_norm_rope_fwd_kernel(
-        Q,
-        K,
-        Q_OUT,
-        K_OUT,
-        INV_Q,
-        INV_K,
-        COS,
-        SIN,
-        Q_SB: tl.constexpr,
-        Q_ST: tl.constexpr,
-        Q_SH: tl.constexpr,
-        Q_SD: tl.constexpr,
-        K_SB: tl.constexpr,
-        K_ST: tl.constexpr,
-        K_SH: tl.constexpr,
-        K_SD: tl.constexpr,
-        QO_SB: tl.constexpr,
-        QO_ST: tl.constexpr,
-        QO_SH: tl.constexpr,
-        QO_SD: tl.constexpr,
-        KO_SB: tl.constexpr,
-        KO_ST: tl.constexpr,
-        KO_SH: tl.constexpr,
-        KO_SD: tl.constexpr,
-        EPS: tl.constexpr,
-        T: tl.constexpr,
-        N_Q: tl.constexpr,
-        N_K: tl.constexpr,
+    def _qk_norm_rope_kernel(
+        q,
+        k,
+        cos,
+        sin,
+        q_out,
+        k_out,
+        Q_HEADS: tl.constexpr,
+        K_HEADS: tl.constexpr,
+        SEQ_LEN: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         ROTARY_DIM: tl.constexpr,
+        EPS: tl.constexpr,
+        Q_STRIDE_B: tl.constexpr,
+        Q_STRIDE_T: tl.constexpr,
+        Q_STRIDE_H: tl.constexpr,
+        Q_STRIDE_D: tl.constexpr,
+        K_STRIDE_B: tl.constexpr,
+        K_STRIDE_T: tl.constexpr,
+        K_STRIDE_H: tl.constexpr,
+        K_STRIDE_D: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_M: tl.constexpr,
-    ) -> None:
+    ):
         pid_t = tl.program_id(0)
         pid_b = tl.program_id(1)
-        pid_hk = tl.program_id(2)
+        pid_h = tl.program_id(2)
         offs_t = pid_t * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, BLOCK_D)
+        mask = (offs_t[:, None] < SEQ_LEN) & (offs_d[None, :] < HEAD_DIM)
         half: tl.constexpr = ROTARY_DIM // 2
 
-        is_q = pid_hk < N_Q
-        head = tl.where(is_q, pid_hk, pid_hk - N_Q)
-        q_ptr = Q + pid_b * Q_SB + offs_t[:, None] * Q_ST + head * Q_SH + offs_d[None, :] * Q_SD
-        k_ptr = K + pid_b * K_SB + offs_t[:, None] * K_ST + head * K_SH + offs_d[None, :] * K_SD
+        is_q = pid_h < Q_HEADS
+        head = tl.where(is_q, pid_h, pid_h - Q_HEADS)
+        q_ptr = q + pid_b * Q_STRIDE_B + offs_t[:, None] * Q_STRIDE_T + head * Q_STRIDE_H + offs_d[None, :] * Q_STRIDE_D
+        k_ptr = k + pid_b * K_STRIDE_B + offs_t[:, None] * K_STRIDE_T + head * K_STRIDE_H + offs_d[None, :] * K_STRIDE_D
         x_ptr = tl.where(is_q, q_ptr, k_ptr)
-        mask = (offs_t[:, None] < T) & (offs_d[None, :] < HEAD_DIM)
+        x_vals = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x_vals * x_vals, axis=1) / HEAD_DIM + EPS)
+        x_norm = x_vals * inv[:, None]
 
-        x = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
-        inv = tl.rsqrt(tl.sum(x * x, axis=1) / HEAD_DIM + EPS)
-        z = x * inv[:, None]
-
-        pair_d = tl.where(offs_d < half, offs_d + half, offs_d - half)
-        q_pair_ptr = Q + pid_b * Q_SB + offs_t[:, None] * Q_ST + head * Q_SH + pair_d[None, :] * Q_SD
-        k_pair_ptr = K + pid_b * K_SB + offs_t[:, None] * K_ST + head * K_SH + pair_d[None, :] * K_SD
+        pass_mask = offs_d >= ROTARY_DIM
+        pair = offs_d % half
+        rot_mask = mask & (offs_d[None, :] < ROTARY_DIM)
+        c = tl.load(cos + offs_t[:, None] * ROTARY_DIM + pair[None, :], mask=rot_mask, other=1.0).to(tl.float32)
+        s = tl.load(sin + offs_t[:, None] * ROTARY_DIM + pair[None, :], mask=rot_mask, other=0.0).to(tl.float32)
+        pair_delta = tl.where(offs_d[None, :] < half, half, -half)
+        q_pair_ptr = q + pid_b * Q_STRIDE_B + offs_t[:, None] * Q_STRIDE_T + head * Q_STRIDE_H + (offs_d[None, :] + pair_delta) * Q_STRIDE_D
+        k_pair_ptr = k + pid_b * K_STRIDE_B + offs_t[:, None] * K_STRIDE_T + head * K_STRIDE_H + (offs_d[None, :] + pair_delta) * K_STRIDE_D
         pair_ptr = tl.where(is_q, q_pair_ptr, k_pair_ptr)
-        pair = tl.load(pair_ptr, mask=mask & (offs_d[None, :] < ROTARY_DIM), other=0.0).to(tl.float32)
-        pair = pair * inv[:, None]
+        x_pair = tl.load(pair_ptr, mask=rot_mask, other=0.0).to(tl.float32) * inv[:, None]
+        sign = tl.where(offs_d < half, -1.0, 1.0)
+        x_rot = tl.where(pass_mask[None, :], x_norm, x_norm * c + sign[None, :] * x_pair * s)
 
-        rot_i = tl.where(offs_d < half, offs_d, offs_d - half)
-        rot_mask = (offs_t[:, None] < T) & (offs_d[None, :] < ROTARY_DIM)
-        c = tl.load(COS + offs_t[:, None] * half + rot_i[None, :], mask=rot_mask, other=1.0).to(tl.float32)
-        s = tl.load(SIN + offs_t[:, None] * half + rot_i[None, :], mask=rot_mask, other=0.0).to(tl.float32)
-
-        y_lo = z * c - pair * s
-        y_hi = z * c + pair * s
-        y = tl.where(offs_d[None, :] < half, y_lo, tl.where(offs_d[None, :] < ROTARY_DIM, y_hi, z))
-
-        q_out_ptr = Q_OUT + pid_b * QO_SB + offs_t[:, None] * QO_ST + head * QO_SH + offs_d[None, :] * QO_SD
-        k_out_ptr = K_OUT + pid_b * KO_SB + offs_t[:, None] * KO_ST + head * KO_SH + offs_d[None, :] * KO_SD
+        q_out_ptr = q_out + ((pid_b * SEQ_LEN + offs_t[:, None]) * Q_HEADS + head) * HEAD_DIM + offs_d[None, :]
+        k_out_ptr = k_out + ((pid_b * SEQ_LEN + offs_t[:, None]) * K_HEADS + head) * HEAD_DIM + offs_d[None, :]
         out_ptr = tl.where(is_q, q_out_ptr, k_out_ptr)
-        tl.store(out_ptr, y, mask=mask)
+        tl.store(out_ptr, x_rot, mask=mask)
 
-        inv_q_ptr = INV_Q + (pid_b * T + offs_t) * N_Q + head
-        inv_k_ptr = INV_K + (pid_b * T + offs_t) * N_K + head
-        inv_ptr = tl.where(is_q, inv_q_ptr, inv_k_ptr)
-        tl.store(inv_ptr, inv, mask=offs_t < T)
+    @torch.library.triton_op("simple_lm::qk_norm_rope", mutates_args={})
+    def _triton_qk_norm_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+        q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
+        k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
+        head_dim = q.shape[-1]
+        rotary_dim = cos.shape[-1]
+        seq_len = q.shape[1]
+        cos_2d = cos.reshape(seq_len, rotary_dim)
+        sin_2d = sin.reshape(seq_len, rotary_dim)
+        block_d = triton.next_power_of_2(head_dim)
+        grid = lambda meta: (triton.cdiv(seq_len, meta["BLOCK_M"]), q.shape[0], q.shape[2] + k.shape[2])
+        torch.library.wrap_triton(_qk_norm_rope_kernel)[grid](
+            q,
+            k,
+            cos_2d,
+            sin_2d,
+            q_out,
+            k_out,
+            q.shape[2],
+            k.shape[2],
+            seq_len,
+            head_dim,
+            rotary_dim,
+            eps,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            BLOCK_D=block_d,
+        )
+        return q_out, k_out
 
     @triton.autotune(
         configs=_QK_NORM_ROPE_CONFIGS,
-        key=["T", "N_Q", "N_K", "HEAD_DIM", "ROTARY_DIM"],
+        key=["SEQ_LEN", "Q_HEADS", "K_HEADS", "HEAD_DIM", "ROTARY_DIM"],
     )
     @triton.jit
-    def _qk_norm_rope_bwd_kernel(
-        DQ_OUT,
-        DK_OUT,
-        Q,
-        K,
-        DQ,
-        DK,
-        INV_Q,
-        INV_K,
-        COS,
-        SIN,
-        DQO_SB: tl.constexpr,
-        DQO_ST: tl.constexpr,
-        DQO_SH: tl.constexpr,
-        DQO_SD: tl.constexpr,
-        DKO_SB: tl.constexpr,
-        DKO_ST: tl.constexpr,
-        DKO_SH: tl.constexpr,
-        DKO_SD: tl.constexpr,
-        Q_SB: tl.constexpr,
-        Q_ST: tl.constexpr,
-        Q_SH: tl.constexpr,
-        Q_SD: tl.constexpr,
-        K_SB: tl.constexpr,
-        K_ST: tl.constexpr,
-        K_SH: tl.constexpr,
-        K_SD: tl.constexpr,
-        DQ_SB: tl.constexpr,
-        DQ_ST: tl.constexpr,
-        DQ_SH: tl.constexpr,
-        DQ_SD: tl.constexpr,
-        DK_SB: tl.constexpr,
-        DK_ST: tl.constexpr,
-        DK_SH: tl.constexpr,
-        DK_SD: tl.constexpr,
-        T: tl.constexpr,
-        N_Q: tl.constexpr,
-        N_K: tl.constexpr,
+    def _qk_norm_rope_backward_kernel(
+        q,
+        k,
+        grad_q,
+        grad_k,
+        cos,
+        sin,
+        grad_q_out,
+        grad_k_out,
+        Q_HEADS: tl.constexpr,
+        K_HEADS: tl.constexpr,
+        SEQ_LEN: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         ROTARY_DIM: tl.constexpr,
+        EPS: tl.constexpr,
+        Q_STRIDE_B: tl.constexpr,
+        Q_STRIDE_T: tl.constexpr,
+        Q_STRIDE_H: tl.constexpr,
+        Q_STRIDE_D: tl.constexpr,
+        K_STRIDE_B: tl.constexpr,
+        K_STRIDE_T: tl.constexpr,
+        K_STRIDE_H: tl.constexpr,
+        K_STRIDE_D: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_M: tl.constexpr,
-    ) -> None:
+    ):
         pid_t = tl.program_id(0)
         pid_b = tl.program_id(1)
-        pid_hk = tl.program_id(2)
+        pid_h = tl.program_id(2)
         offs_t = pid_t * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, BLOCK_D)
+        mask = (offs_t[:, None] < SEQ_LEN) & (offs_d[None, :] < HEAD_DIM)
         half: tl.constexpr = ROTARY_DIM // 2
 
-        is_q = pid_hk < N_Q
-        head = tl.where(is_q, pid_hk, pid_hk - N_Q)
-        mask = (offs_t[:, None] < T) & (offs_d[None, :] < HEAD_DIM)
-
-        dqo_ptr = DQ_OUT + pid_b * DQO_SB + offs_t[:, None] * DQO_ST + head * DQO_SH + offs_d[None, :] * DQO_SD
-        dko_ptr = DK_OUT + pid_b * DKO_SB + offs_t[:, None] * DKO_ST + head * DKO_SH + offs_d[None, :] * DKO_SD
-        q_ptr = Q + pid_b * Q_SB + offs_t[:, None] * Q_ST + head * Q_SH + offs_d[None, :] * Q_SD
-        k_ptr = K + pid_b * K_SB + offs_t[:, None] * K_ST + head * K_SH + offs_d[None, :] * K_SD
-        dy_ptr = tl.where(is_q, dqo_ptr, dko_ptr)
+        is_q = pid_h < Q_HEADS
+        head = tl.where(is_q, pid_h, pid_h - Q_HEADS)
+        q_ptr = q + pid_b * Q_STRIDE_B + offs_t[:, None] * Q_STRIDE_T + head * Q_STRIDE_H + offs_d[None, :] * Q_STRIDE_D
+        k_ptr = k + pid_b * K_STRIDE_B + offs_t[:, None] * K_STRIDE_T + head * K_STRIDE_H + offs_d[None, :] * K_STRIDE_D
         x_ptr = tl.where(is_q, q_ptr, k_ptr)
+        x_vals = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
 
-        dy = tl.load(dy_ptr, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
+        q_grad_ptr = grad_q + ((pid_b * SEQ_LEN + offs_t[:, None]) * Q_HEADS + head) * HEAD_DIM + offs_d[None, :]
+        k_grad_ptr = grad_k + ((pid_b * SEQ_LEN + offs_t[:, None]) * K_HEADS + head) * HEAD_DIM + offs_d[None, :]
+        grad_ptr = tl.where(is_q, q_grad_ptr, k_grad_ptr)
+        grad_vals = tl.load(grad_ptr, mask=mask, other=0.0).to(tl.float32)
 
-        pair_d = tl.where(offs_d < half, offs_d + half, offs_d - half)
-        dqo_pair = DQ_OUT + pid_b * DQO_SB + offs_t[:, None] * DQO_ST + head * DQO_SH + pair_d[None, :] * DQO_SD
-        dko_pair = DK_OUT + pid_b * DKO_SB + offs_t[:, None] * DKO_ST + head * DKO_SH + pair_d[None, :] * DKO_SD
-        dy_pair = tl.load(tl.where(is_q, dqo_pair, dko_pair), mask=mask & (offs_d[None, :] < ROTARY_DIM), other=0.0).to(tl.float32)
+        inv = tl.rsqrt(tl.sum(x_vals * x_vals, axis=1) / HEAD_DIM + EPS)
+        pass_mask = offs_d >= ROTARY_DIM
+        pair = offs_d % half
+        rot_mask = mask & (offs_d[None, :] < ROTARY_DIM)
+        c = tl.load(cos + offs_t[:, None] * ROTARY_DIM + pair[None, :], mask=rot_mask, other=1.0).to(tl.float32)
+        s = tl.load(sin + offs_t[:, None] * ROTARY_DIM + pair[None, :], mask=rot_mask, other=0.0).to(tl.float32)
+        pair_delta = tl.where(offs_d[None, :] < half, half, -half)
+        q_grad_pair_ptr = grad_q + ((pid_b * SEQ_LEN + offs_t[:, None]) * Q_HEADS + head) * HEAD_DIM + offs_d[None, :] + pair_delta
+        k_grad_pair_ptr = grad_k + ((pid_b * SEQ_LEN + offs_t[:, None]) * K_HEADS + head) * HEAD_DIM + offs_d[None, :] + pair_delta
+        grad_pair_ptr = tl.where(is_q, q_grad_pair_ptr, k_grad_pair_ptr)
+        grad_pair = tl.load(grad_pair_ptr, mask=rot_mask, other=0.0).to(tl.float32)
+        sign = tl.where(offs_d < half, 1.0, -1.0)
+        grad_norm = tl.where(pass_mask[None, :], grad_vals, grad_vals * c + sign[None, :] * grad_pair * s)
 
-        rot_i = tl.where(offs_d < half, offs_d, offs_d - half)
-        rot_mask = (offs_t[:, None] < T) & (offs_d[None, :] < ROTARY_DIM)
-        c = tl.load(COS + offs_t[:, None] * half + rot_i[None, :], mask=rot_mask, other=1.0).to(tl.float32)
-        s = tl.load(SIN + offs_t[:, None] * half + rot_i[None, :], mask=rot_mask, other=0.0).to(tl.float32)
+        z = x_vals * inv[:, None]
+        dot = tl.sum(grad_norm * z, axis=1) / HEAD_DIM
+        grad_x = inv[:, None] * (grad_norm - z * dot[:, None])
+        q_grad_out_ptr = grad_q_out + ((pid_b * SEQ_LEN + offs_t[:, None]) * Q_HEADS + head) * HEAD_DIM + offs_d[None, :]
+        k_grad_out_ptr = grad_k_out + ((pid_b * SEQ_LEN + offs_t[:, None]) * K_HEADS + head) * HEAD_DIM + offs_d[None, :]
+        grad_out_ptr = tl.where(is_q, q_grad_out_ptr, k_grad_out_ptr)
+        tl.store(grad_out_ptr, grad_x, mask=mask)
 
-        g_lo = dy * c + dy_pair * s
-        g_hi = dy * c - dy_pair * s
-        g = tl.where(offs_d[None, :] < half, g_lo, tl.where(offs_d[None, :] < ROTARY_DIM, g_hi, dy))
-
-        inv_q_ptr = INV_Q + (pid_b * T + offs_t) * N_Q + head
-        inv_k_ptr = INV_K + (pid_b * T + offs_t) * N_K + head
-        inv = tl.load(tl.where(is_q, inv_q_ptr, inv_k_ptr), mask=offs_t < T, other=0.0).to(tl.float32)
-        z = x * inv[:, None]
-        dot = tl.sum(g * z, axis=1) / HEAD_DIM
-        dx = inv[:, None] * (g - z * dot[:, None])
-
-        dq_ptr = DQ + pid_b * DQ_SB + offs_t[:, None] * DQ_ST + head * DQ_SH + offs_d[None, :] * DQ_SD
-        dk_ptr = DK + pid_b * DK_SB + offs_t[:, None] * DK_ST + head * DK_SH + offs_d[None, :] * DK_SD
-        tl.store(tl.where(is_q, dq_ptr, dk_ptr), dx, mask=mask)
+    @torch.library.triton_op("simple_lm::qk_norm_rope_backward", mutates_args={})
+    def _triton_qk_norm_rope_backward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        grad_q: torch.Tensor,
+        grad_k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        grad_q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
+        grad_k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
+        head_dim = q.shape[-1]
+        rotary_dim = cos.shape[-1]
+        seq_len = q.shape[1]
+        cos_2d = cos.reshape(seq_len, rotary_dim)
+        sin_2d = sin.reshape(seq_len, rotary_dim)
+        block_d = triton.next_power_of_2(head_dim)
+        grid = lambda meta: (triton.cdiv(seq_len, meta["BLOCK_M"]), q.shape[0], q.shape[2] + k.shape[2])
+        torch.library.wrap_triton(_qk_norm_rope_backward_kernel)[grid](
+            q,
+            k,
+            grad_q,
+            grad_k,
+            cos_2d,
+            sin_2d,
+            grad_q_out,
+            grad_k_out,
+            q.shape[2],
+            k.shape[2],
+            seq_len,
+            head_dim,
+            rotary_dim,
+            eps,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            BLOCK_D=block_d,
+        )
+        return grad_q_out, grad_k_out
 else:
-    _qk_norm_rope_fwd_kernel = None
-    _qk_norm_rope_bwd_kernel = None
-
-
-def _rope_half_tables(cos: torch.Tensor, sin: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    if cos.ndim == 4:
-        if cos.shape[1] >= seq_len:
-            cos = cos[0, :seq_len, 0]
-            sin = sin[0, :seq_len, 0]
-        elif cos.shape[2] >= seq_len:
-            cos = cos[0, 0, :seq_len]
-            sin = sin[0, 0, :seq_len]
-        else:
-            raise RuntimeError(f"RoPE cache is shorter than sequence length {seq_len}")
-    elif cos.ndim != 2:
-        raise RuntimeError(f"unsupported RoPE table shape {tuple(cos.shape)}")
-    rotary_dim = cos.shape[-1]
-    if rotary_dim % 2 != 0:
-        raise RuntimeError(f"RoPE rotary_dim must be even, got {rotary_dim}")
-    half = rotary_dim // 2
-    return cos[:, :half].contiguous(), sin[:, :half].contiguous()
+    _triton_qk_norm_rope = None
+    _triton_qk_norm_rope_backward_op = None
 
 
 def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -445,131 +429,54 @@ def _qk_norm_rope_torch(
     if cos.ndim == 4 and cos.shape[1] != q.shape[1] and cos.shape[2] == q.shape[1]:
         cos = cos.transpose(1, 2)
         sin = sin.transpose(1, 2)
-    q_normed = rms_norm(q, None, eps, backend="torch")
-    k_normed = rms_norm(k, None, eps, backend="torch")
+    q_normed = rms_norm(q, None, eps)
+    k_normed = rms_norm(k, None, eps)
     return _apply_partial_rope(q_normed, cos, sin), _apply_partial_rope(k_normed, cos, sin)
 
 
-class _QKNormRoPE(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        cos_half: torch.Tensor,
-        sin_half: torch.Tensor,
-        eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        _require_triton("rope_backend=triton_qk_norm_rope")
-        if not q.is_cuda or not k.is_cuda:
-            raise RuntimeError("rope_backend=triton_qk_norm_rope requires CUDA tensors")
-        if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1] or q.shape[-1] != k.shape[-1]:
-            raise RuntimeError(f"Q/K shape mismatch: q={tuple(q.shape)}, k={tuple(k.shape)}")
-        batch, seq_len, n_q, head_dim = q.shape
-        n_k = k.shape[2]
-        rotary_dim = cos_half.shape[-1] * 2
-        if head_dim & (head_dim - 1):
-            raise RuntimeError(f"Triton QK norm RoPE requires power-of-two head_dim, got {head_dim}")
-        if rotary_dim > head_dim:
-            raise RuntimeError(f"rotary_dim={rotary_dim} exceeds head_dim={head_dim}")
+def _qk_norm_rope_setup(ctx, inputs, output) -> None:
+    q, k, cos, sin, eps = inputs
+    ctx.save_for_backward(q, k, cos, sin)
+    ctx.eps = eps
 
-        q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
-        k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
-        inv_q = torch.empty((batch, seq_len, n_q), device=q.device, dtype=torch.float32)
-        inv_k = torch.empty((batch, seq_len, n_k), device=k.device, dtype=torch.float32)
-        grid = lambda meta: (triton.cdiv(seq_len, meta["BLOCK_M"]), batch, n_q + n_k)
-        _qk_norm_rope_fwd_kernel[grid](
+
+def _norm_backward_no_weight(x: torch.Tensor, grad: torch.Tensor, eps: float) -> torch.Tensor:
+    x_f = x.float()
+    grad_f = grad.float()
+    inv = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps)
+    dot = (grad_f * x_f).mean(dim=-1, keepdim=True)
+    return ((grad_f * inv) - (x_f * inv.pow(3) * dot)).to(x.dtype)
+
+
+def _qk_norm_rope_backward(
+    ctx,
+    grad_q: torch.Tensor | None,
+    grad_k: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
+    q, k, cos, sin = ctx.saved_tensors
+    if grad_q is None:
+        grad_q = torch.zeros_like(q, memory_format=torch.contiguous_format)
+    if grad_k is None:
+        grad_k = torch.zeros_like(k, memory_format=torch.contiguous_format)
+    if q.is_cuda:
+        grad_q_in, grad_k_in = _triton_qk_norm_rope_backward_op(
             q,
             k,
-            q_out,
-            k_out,
-            inv_q,
-            inv_k,
-            cos_half,
-            sin_half,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            q_out.stride(0),
-            q_out.stride(1),
-            q_out.stride(2),
-            q_out.stride(3),
-            k_out.stride(0),
-            k_out.stride(1),
-            k_out.stride(2),
-            k_out.stride(3),
-            float(eps),
-            seq_len,
-            n_q,
-            n_k,
-            HEAD_DIM=head_dim,
-            ROTARY_DIM=rotary_dim,
-            BLOCK_D=triton.next_power_of_2(head_dim),
+            grad_q.contiguous(),
+            grad_k.contiguous(),
+            cos,
+            sin,
+            ctx.eps,
         )
-        ctx.save_for_backward(q, k, inv_q, inv_k, cos_half, sin_half)
-        ctx.meta = (seq_len, n_q, n_k, head_dim, rotary_dim)
-        return q_out, k_out
+    else:
+        grad_q_norm, grad_k_norm = _apply_partial_rope(grad_q, cos, -sin), _apply_partial_rope(grad_k, cos, -sin)
+        grad_q_in = _norm_backward_no_weight(q, grad_q_norm, ctx.eps)
+        grad_k_in = _norm_backward_no_weight(k, grad_k_norm, ctx.eps)
+    return grad_q_in, grad_k_in, None, None, None
 
-    @staticmethod
-    def backward(ctx: Any, dq_out: torch.Tensor | None, dk_out: torch.Tensor | None) -> tuple[Any, ...]:
-        q, k, inv_q, inv_k, cos_half, sin_half = ctx.saved_tensors
-        seq_len, n_q, n_k, head_dim, rotary_dim = ctx.meta
-        if dq_out is None:
-            dq_out = torch.zeros_like(q, memory_format=torch.contiguous_format)
-        if dk_out is None:
-            dk_out = torch.zeros_like(k, memory_format=torch.contiguous_format)
-        dq = torch.empty_like(q, memory_format=torch.contiguous_format)
-        dk = torch.empty_like(k, memory_format=torch.contiguous_format)
-        batch = q.shape[0]
-        grid = lambda meta: (triton.cdiv(seq_len, meta["BLOCK_M"]), batch, n_q + n_k)
-        _qk_norm_rope_bwd_kernel[grid](
-            dq_out,
-            dk_out,
-            q,
-            k,
-            dq,
-            dk,
-            inv_q,
-            inv_k,
-            cos_half,
-            sin_half,
-            dq_out.stride(0),
-            dq_out.stride(1),
-            dq_out.stride(2),
-            dq_out.stride(3),
-            dk_out.stride(0),
-            dk_out.stride(1),
-            dk_out.stride(2),
-            dk_out.stride(3),
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            dq.stride(0),
-            dq.stride(1),
-            dq.stride(2),
-            dq.stride(3),
-            dk.stride(0),
-            dk.stride(1),
-            dk.stride(2),
-            dk.stride(3),
-            seq_len,
-            n_q,
-            n_k,
-            HEAD_DIM=head_dim,
-            ROTARY_DIM=rotary_dim,
-            BLOCK_D=triton.next_power_of_2(head_dim),
-        )
-        return dq, dk, None, None, None
+
+if triton is not None:
+    torch.library.register_autograd("simple_lm::qk_norm_rope", _qk_norm_rope_backward, setup_context=_qk_norm_rope_setup)
 
 
 def qk_norm_rope(
@@ -582,10 +489,12 @@ def qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if backend == "torch":
         return _qk_norm_rope_torch(q, k, cos, sin, eps)
-    if backend != "triton_qk_norm_rope":
-        raise RuntimeError(f"unsupported QK norm RoPE backend {backend!r}")
-    cos_half, sin_half = _rope_half_tables(cos, sin, q.shape[1])
-    return _QKNormRoPE.apply(q, k, cos_half, sin_half, eps)
+    if backend == "triton":
+        if q.is_cuda:
+            _require_triton("rope_backend=triton")
+            return _triton_qk_norm_rope(q, k, cos, sin, eps)
+        return _qk_norm_rope_torch(q, k, cos, sin, eps)
+    raise RuntimeError(f"unsupported QK norm RoPE backend {backend!r}")
 
 
 def scaled_dot_product_attention(

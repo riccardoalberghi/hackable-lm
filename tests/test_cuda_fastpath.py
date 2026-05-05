@@ -21,8 +21,6 @@ def test_optimizer_resume_muon_state_device() -> None:
         device_batch_size=2,
         precision="bf16",
         compile_model=False,
-        norm_backend="torch",
-        mlp_backend="torch",
         loss_backend="torch",
     )
     device = torch.device("cuda")

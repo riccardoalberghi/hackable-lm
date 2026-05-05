@@ -242,12 +242,6 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
     if args.loss_backend is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.loss_backend = model_cfg.get("loss_backend")
-    if args.norm_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.norm_backend = model_cfg.get("norm_backend")
-    if args.mlp_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.mlp_backend = model_cfg.get("mlp_backend")
     if args.rope_backend is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.rope_backend = model_cfg.get("rope_backend")
@@ -326,9 +320,7 @@ def main() -> None:
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
     parser.add_argument("--loss-backend", choices=["torch", "liger"])
-    parser.add_argument("--mlp-backend", choices=["torch", "liger"])
-    parser.add_argument("--norm-backend", choices=["torch", "liger"])
-    parser.add_argument("--rope-backend", choices=["torch", "triton_qk_norm_rope"])
+    parser.add_argument("--rope-backend", choices=["torch", "triton"])
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-mode", default=DEFAULTS["compile_mode"], choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     parser.add_argument("--no-compile-capture-scalar-outputs", action="store_true")
@@ -352,8 +344,6 @@ def main() -> None:
     args.attention_window = args.attention_window if args.attention_window is not None else DEFAULTS["attention_window"]
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
     args.target_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio is not None else DEFAULTS["target_param_data_ratio"]
-    args.norm_backend = args.norm_backend if args.norm_backend is not None else DEFAULTS["norm_backend"]
-    args.mlp_backend = args.mlp_backend if args.mlp_backend is not None else DEFAULTS["mlp_backend"]
     args.loss_backend = args.loss_backend if args.loss_backend is not None else DEFAULTS["loss_backend"]
     args.rope_backend = args.rope_backend if args.rope_backend is not None else DEFAULTS["rope_backend"]
     if args.depth is None and args.target_params is None:
@@ -390,8 +380,6 @@ def main() -> None:
         compile_mode=args.compile_mode,
         compile_capture_scalar_outputs=not args.no_compile_capture_scalar_outputs,
         kernel_backend="torch",
-        norm_backend=args.norm_backend,
-        mlp_backend=args.mlp_backend,
         loss_backend=args.loss_backend,
         rope_backend=args.rope_backend,
         comparison_mode=args.comparison_mode,
@@ -417,8 +405,6 @@ def main() -> None:
         config.compile,
         config.compile_mode,
         config.compile_capture_scalar_outputs,
-        config.model.norm_backend,
-        config.model.mlp_backend,
         config.model.loss_backend,
         config.model.rope_backend,
     ).to_dict()

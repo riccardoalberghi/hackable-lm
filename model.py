@@ -12,14 +12,13 @@ from config import ModelConfig, layer_attention_window
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, param: bool = False, backend: str = "torch") -> None:
+    def __init__(self, dim: int, eps: float = 1e-6, param: bool = False) -> None:
         super().__init__()
         self.eps = eps
-        self.backend = backend
         self.weight = nn.Parameter(torch.ones(dim)) if param else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return kernels.rms_norm(x, self.weight, self.eps, backend=self.backend)
+        return kernels.rms_norm(x, self.weight, self.eps)
 
 
 class Linear(nn.Linear):
@@ -81,8 +80,8 @@ class CausalSelfAttention(nn.Module):
         self.kv_dim = config.n_kv_head * config.head_dim
         self.qkv_proj = Linear(config.n_embd, self.q_dim + 2 * self.kv_dim, bias=False)
         self.o_proj = Linear(config.n_head * config.head_dim, config.n_embd, bias=False)
-        self.q_norm = RMSNorm(config.head_dim, config.norm_eps, backend=config.norm_backend) if config.qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(config.head_dim, config.norm_eps, backend=config.norm_backend) if config.qk_norm else nn.Identity()
+        self.q_norm = RMSNorm(config.head_dim, config.norm_eps) if config.qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(config.head_dim, config.norm_eps) if config.qk_norm else nn.Identity()
         self.rope = RotaryEmbedding(config.head_dim, config.rope_theta, config.rope_fraction)
         self._mask_cache: torch.Tensor | None = None
         self._mask_cache_seq_len = 0
@@ -112,9 +111,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(bsz, seq_len, self.n_kv_head, self.head_dim)
         v = v.view(bsz, seq_len, self.n_kv_head, self.head_dim)
         cos, sin = self.rope(seq_len, x.device, q.dtype)
-        if self.config.rope_backend == "triton_qk_norm_rope":
+        if self.config.rope_backend == "triton":
             if not self.config.qk_norm:
-                raise RuntimeError("rope_backend=triton_qk_norm_rope requires qk_norm=True")
+                raise RuntimeError("rope_backend=triton requires qk_norm=True")
             q, k = kernels.qk_norm_rope(
                 q,
                 k,
@@ -157,21 +156,20 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.backend = config.mlp_backend
         self.gate_up_proj = Linear(config.n_embd, 2 * config.mlp_hidden, bias=False)
         self.down_proj = Linear(config.mlp_hidden, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(kernels.swiglu(gate, up, backend=self.backend))
+        return self.down_proj(kernels.swiglu(gate, up))
 
 
 class Block(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
-        self.norm_1 = RMSNorm(config.n_embd, config.norm_eps, backend=config.norm_backend)
+        self.norm_1 = RMSNorm(config.n_embd, config.norm_eps)
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.norm_2 = RMSNorm(config.n_embd, config.norm_eps, backend=config.norm_backend)
+        self.norm_2 = RMSNorm(config.n_embd, config.norm_eps)
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -186,7 +184,7 @@ class LanguageModel(nn.Module):
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)])
-        self.norm_f = RMSNorm(config.n_embd, config.norm_eps, backend=config.norm_backend)
+        self.norm_f = RMSNorm(config.n_embd, config.norm_eps)
         self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight

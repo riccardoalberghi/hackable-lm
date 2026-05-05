@@ -237,7 +237,7 @@ intentional non-paper debugging.
 - `tokenizer.py`: tokenizer training/loading/encoding boundary
 - `prepare_data.py`: raw text/jsonl to token memmaps
 - `data.py`: static-shape packed-token memmap batches
-- `kernels.py`: bf16 precision policy, FlashAttention 2, Liger RMSNorm/SwiGLU/fused linear CE, compile, and backend resolution
+- `kernels.py`: bf16 precision policy, FlashAttention 2, standard Liger linear CE, compile, and backend resolution
 - `train.py`: pretraining loop, logging, validation, checkpointing
 - `prepare_eval.py`, `eval_tasks.py`, `eval.py`: local inspectable eval suite
 - `repro.py`: seeds, hashes, environment, manifests, comparison warnings

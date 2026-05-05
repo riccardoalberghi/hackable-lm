@@ -86,6 +86,9 @@ def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
     k_ref = ref(k)
     assert torch.allclose(q_out, q_ref, atol=1e-6)
     assert torch.allclose(k_out, k_ref, atol=1e-6)
+    q_triton_cpu, k_triton_cpu = kernels.qk_norm_rope(q, k, cos, sin, 1e-6, backend="triton")
+    assert torch.allclose(q_triton_cpu, q_ref, atol=1e-6)
+    assert torch.allclose(k_triton_cpu, k_ref, atol=1e-6)
 
     dq = torch.randn_like(q_out)
     dk = torch.randn_like(k_out)
@@ -109,16 +112,24 @@ def test_kernel_resolution_and_hashing() -> None:
         "torch",
         "fp32_test",
         False,
-        norm_backend="liger",
-        mlp_backend="liger",
         loss_backend="liger",
         allow_torch_backend=True,
     )
     assert info.actual_attention_backend in {"flash_attn_2", "torch_sdpa"}
-    assert info.actual_norm_backend in {"liger_rms_norm", "torch"}
-    assert info.actual_mlp_backend in {"liger_swiglu", "torch"}
+    assert info.actual_norm_backend == "torch"
+    assert info.actual_mlp_backend == "torch"
     assert info.actual_loss_backend in {"liger_fused_linear_ce", "torch"}
     assert info.actual_rope_backend == "torch"
     assert isinstance(info.liger_available, bool)
     assert isinstance(info.triton_available, bool)
+    rope_info = resolve_kernel_backends(
+        "torch",
+        "fp32_test",
+        False,
+        loss_backend="liger",
+        rope_backend="triton",
+        allow_torch_backend=True,
+    )
+    assert rope_info.actual_loss_backend in {"liger_fused_linear_ce", "torch"}
+    assert rope_info.actual_rope_backend in {"triton", "torch"}
     assert len(hash_directory(Path.cwd())) == 64
