@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from config import DEFAULTS, auto_device_batch_size, config_from_dict, depth_dimensions, layer_attention_window, resolve_config, scaling_params_for_depth
 
 
@@ -18,6 +20,7 @@ def test_config_derivation() -> None:
     assert DEFAULTS["sequence_len"] == 2048
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
+    assert DEFAULTS["lr_depth_stability_reference"] == 6
     assert DEFAULTS["norm_backend"] == "liger"
     assert DEFAULTS["mlp_backend"] == "liger"
     assert DEFAULTS["loss_backend"] == "liger"
@@ -85,6 +88,27 @@ def test_auto_device_batch_size_l40_shapes() -> None:
         n_embd, _ = depth_dimensions(depth)
         actual[depth] = auto_device_batch_size(depth, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0)
     assert actual == {6: 64, 12: 32, 18: 16, 24: 8}
+
+
+def test_depth_lr_scale_cap_l40_defaults() -> None:
+    cfg6 = resolve_config(depth=6, vocab_size=32768, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
+    cfg12 = resolve_config(depth=12, vocab_size=32768, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
+    cfg24 = resolve_config(depth=24, vocab_size=32768, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
+
+    assert math.isclose(cfg6.extra["uncapped_batch_lr_scale"], math.sqrt(393216 / DEFAULTS["reference_batch_tokens"]))
+    assert math.isclose(cfg6.extra["depth_lr_cap"], 1.0)
+    assert math.isclose(cfg6.batch_lr_scale, cfg6.extra["uncapped_batch_lr_scale"])
+    assert math.isclose(cfg6.matrix_lr, DEFAULTS["matrix_lr_ref"] * cfg6.batch_lr_scale)
+
+    assert cfg12.extra["uncapped_batch_lr_scale"] > cfg12.extra["depth_lr_cap"]
+    assert math.isclose(cfg12.batch_lr_scale, math.sqrt(DEFAULTS["lr_depth_stability_reference"] / 12))
+    assert math.isclose(cfg12.matrix_lr, DEFAULTS["matrix_lr_ref"] * cfg12.batch_lr_scale)
+
+    assert cfg24.global_batch_tokens == 753664
+    assert cfg24.extra["uncapped_batch_lr_scale"] > cfg24.extra["depth_lr_cap"]
+    assert math.isclose(cfg24.batch_lr_scale, 0.5)
+    assert math.isclose(cfg24.matrix_lr, 0.01)
+    assert cfg24.extra["lr_depth_stability_reference"] == DEFAULTS["lr_depth_stability_reference"]
 
 
 def test_auto_device_batch_size_scales_with_gpu_memory() -> None:

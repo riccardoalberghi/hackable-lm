@@ -14,7 +14,7 @@ MUON_NAME_MARKERS = (
     "down_proj.weight",
 )
 MUON_STATE_DTYPE = torch.bfloat16
-OPTIMIZER_SCALAR_DTYPE = torch.bfloat16
+OPTIMIZER_SCALAR_DTYPE = torch.float32
 
 
 @torch.compile(dynamic=False, fullgraph=True)

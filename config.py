@@ -20,6 +20,7 @@ DEFAULTS = {
     "auto_device_batch_max": 128,
     "reference_depth": 12,
     "reference_batch_tokens": 2**19,
+    "lr_depth_stability_reference": 6,
     "embedding_lr_ref": 0.1,
     "unembedding_lr_ref": 0.01,
     "matrix_lr_ref": 0.02,
@@ -327,10 +328,12 @@ def resolve_config(
     actual_global = grad_accum * micro_tokens
 
     batch_lr_scale = math.sqrt(actual_global / DEFAULTS["reference_batch_tokens"])
-    embedding_lr = DEFAULTS["embedding_lr_ref"] * batch_lr_scale
-    unembedding_lr = DEFAULTS["unembedding_lr_ref"] * batch_lr_scale
-    matrix_lr = DEFAULTS["matrix_lr_ref"] * batch_lr_scale
-    scalar_lr = DEFAULTS["scalar_lr_ref"] * batch_lr_scale
+    depth_lr_cap = math.sqrt(DEFAULTS["lr_depth_stability_reference"] / depth)
+    lr_scale = min(batch_lr_scale, depth_lr_cap)
+    embedding_lr = DEFAULTS["embedding_lr_ref"] * lr_scale
+    unembedding_lr = DEFAULTS["unembedding_lr_ref"] * lr_scale
+    matrix_lr = DEFAULTS["matrix_lr_ref"] * lr_scale
+    scalar_lr = DEFAULTS["scalar_lr_ref"] * lr_scale
     weight_decay = DEFAULTS["weight_decay"]
 
     flops_per_token = estimate_flops_per_token(depth, n_embd, sequence_len, scaling_params, attention_window, attention_full_every)
@@ -378,7 +381,7 @@ def resolve_config(
         gradient_accumulation_steps=grad_accum,
         total_gradient_accumulation_steps=grad_accum,
         world_size=1,
-        batch_lr_scale=batch_lr_scale,
+        batch_lr_scale=lr_scale,
         embedding_lr=embedding_lr,
         unembedding_lr=unembedding_lr,
         matrix_lr=matrix_lr,
@@ -413,6 +416,9 @@ def resolve_config(
             "requested_device_batch_size": requested_device_batch_size,
             "gpu_memory_gib": gpu_memory_gib,
             "auto_device_batch_memory_fraction": DEFAULTS["auto_device_batch_memory_fraction"],
+            "uncapped_batch_lr_scale": batch_lr_scale,
+            "depth_lr_cap": depth_lr_cap,
+            "lr_depth_stability_reference": DEFAULTS["lr_depth_stability_reference"],
         },
     )
 
