@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from config import DEFAULTS, config_from_dict, layer_attention_window, resolve_config, scaling_params_for_depth
+from config import DEFAULTS, auto_device_batch_size, config_from_dict, depth_dimensions, layer_attention_window, resolve_config, scaling_params_for_depth
 
 
 def test_config_derivation() -> None:
@@ -18,14 +18,18 @@ def test_config_derivation() -> None:
     assert DEFAULTS["sequence_len"] == 2048
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
-    assert DEFAULTS["norm_backend"] == "torch"
+    assert DEFAULTS["norm_backend"] == "liger"
+    assert DEFAULTS["mlp_backend"] == "liger"
     assert DEFAULTS["loss_backend"] == "liger"
+    assert DEFAULTS["rope_backend"] == "torch"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
-    assert default_cfg.model.norm_backend == "torch"
+    assert default_cfg.model.norm_backend == "liger"
+    assert default_cfg.model.mlp_backend == "liger"
     assert default_cfg.model.loss_backend == "liger"
+    assert default_cfg.model.rope_backend == "torch"
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
     assert pattern == [512, 512, 512, None, 512, 512, 512, None]
     short_pattern = [layer_attention_window(i, 3, 512, 4) for i in range(3)]
@@ -46,9 +50,14 @@ def test_config_derivation() -> None:
     legacy_style = cfg.to_dict()
     legacy_style["model"].pop("loss_backend")
     assert config_from_dict(legacy_style).model.loss_backend == DEFAULTS["loss_backend"]
+    legacy_style = cfg.to_dict()
+    legacy_style["model"].pop("mlp_backend")
+    assert config_from_dict(legacy_style).model.mlp_backend == DEFAULTS["mlp_backend"]
     stale_mlp_style = cfg.to_dict()
     stale_mlp_style["model"]["mlp_activation"] = "legacy"
     assert not hasattr(config_from_dict(stale_mlp_style).model, "mlp_activation")
+    triton_rope = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="triton_qk_norm_rope")
+    assert triton_rope.model.rope_backend == "triton_qk_norm_rope"
 
 
 def test_config_shape_and_budget_controls() -> None:
@@ -68,3 +77,52 @@ def test_config_shape_and_budget_controls() -> None:
         assert "choose only one budget override" in str(exc)
     else:
         raise AssertionError("conflicting budget overrides should fail")
+
+
+def test_auto_device_batch_size_l40_shapes() -> None:
+    actual = {}
+    for depth in (6, 12, 18, 24):
+        n_embd, _ = depth_dimensions(depth)
+        actual[depth] = auto_device_batch_size(depth, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0)
+    assert actual == {6: 64, 12: 32, 18: 16, 24: 8}
+
+
+def test_auto_device_batch_size_scales_with_gpu_memory() -> None:
+    n_embd, _ = depth_dimensions(12)
+    small = auto_device_batch_size(12, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=12.0)
+    large = auto_device_batch_size(12, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0)
+    assert small < large
+
+
+def test_explicit_device_batch_size_overrides_auto() -> None:
+    omitted_cfg = resolve_config(
+        depth=12,
+        vocab_size=32768,
+        gpu_memory_gib=48.0,
+        precision="fp32_test",
+        compile_model=False,
+    )
+    assert omitted_cfg.device_batch_size == 32
+    assert omitted_cfg.extra["requested_device_batch_size"] is None
+
+    cfg = resolve_config(
+        depth=12,
+        vocab_size=32768,
+        device_batch_size=7,
+        gpu_memory_gib=48.0,
+        precision="fp32_test",
+        compile_model=False,
+    )
+    assert cfg.device_batch_size == 7
+    assert cfg.extra["requested_device_batch_size"] == 7
+
+    auto_cfg = resolve_config(
+        depth=12,
+        vocab_size=32768,
+        device_batch_size=0,
+        gpu_memory_gib=48.0,
+        precision="fp32_test",
+        compile_model=False,
+    )
+    assert auto_cfg.device_batch_size == 32
+    assert auto_cfg.extra["requested_device_batch_size"] == 0

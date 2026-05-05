@@ -39,14 +39,14 @@ Do not build:
 1. Easy for future coding agents to modify architecture and training ideas.
 2. Strong modern small-LM baseline, suitable for ablations.
 3. High MFU on NVIDIA L40; A100/H100 are secondary targets.
-4. Fast path first: CUDA + local tensorwise FP8 for eligible linear layers + Muon + FlashAttention 2 + `torch.compile`.
+4. Fast path first: CUDA + bf16 + Muon + FlashAttention 2 + Liger kernels + `torch.compile`.
 5. One main scale knob: `--depth`.
 6. Simple depth-derived scaling policy, without copying an external recipe.
 7. Project-native preprocessing from raw text to token memmaps.
 8. Validation loss as the primary fast signal, plus small pretrained-LM evals.
 9. Maximum practical reproducibility for fair baseline-vs-candidate comparison,
    excluding unavoidable GPU/kernel nondeterminism.
-10. Fused kernels enabled by default, with a clean path for custom Triton kernels.
+10. Liger fused kernels enabled by default where available.
 11. A first-time user should be able to preprocess, train, and evaluate with a
     small number of obvious commands.
 12. Paper-seed readiness: the repo should be a credible starting point for
@@ -61,17 +61,17 @@ The normal runtime target is:
 
 ```text
 device: CUDA
-precision: fp8
+precision: bf16
 optimizer: muon, with AdamW groups for parameters where Muon is inappropriate
-norm kernels: torch
+norm kernels: Liger RMSNorm
 lm-head + cross entropy: Liger fused linear CE
-MLP nonlinear kernels: torch
+MLP nonlinear kernels: Liger SwiGLU
 compile: true
 ```
 
-Do not provide a first-class BF16/AdamW/Torch-kernel training flow. Small CPU or
-Torch-only unit tests are allowed for correctness, but they are not a training
-fallback and should not appear as a golden path.
+Do not provide first-class alternate-precision/AdamW/Torch-kernel training
+flows. Small CPU or Torch-only unit tests are allowed for correctness, but they
+are not a training fallback and should not appear as a golden path.
 
 If a fast-path dependency is missing, fail clearly with an actionable install
 message. Do not silently fall back to slower kernels or alternate optimizers.
@@ -93,10 +93,10 @@ repro.py
 eval.py
 eval_tasks.py
 prepare_eval.py
-triton_kernels/
 tests/
 AGENTS.md
-requirements.txt
+pyproject.toml
+uv.lock
 README.md
 ```
 
@@ -110,19 +110,19 @@ understand every subsystem before getting a real run.
 The first successful flow should be:
 
 ```bash
-pip install -r requirements.txt
+uv sync --locked
 
-python prepare_data.py all \
+uv run python prepare_data.py all \
   --input data/raw/*.txt \
   --vocab-size 32768 \
   --output data/processed
 
-python train.py \
+uv run python train.py \
   --depth 12 \
   --data data/processed \
   --run-name d12
 
-python eval.py \
+uv run python eval.py \
   --checkpoint runs/d12/checkpoints/latest.pt \
   --tasks lambada_openai,hellaswag \
   --limit-per-task 128
@@ -131,7 +131,7 @@ python eval.py \
 Normal model scaling should be:
 
 ```bash
-python train.py --depth 20 --data data/processed --run-name d20
+uv run python train.py --depth 20 --data data/processed --run-name d20
 ```
 
 Advanced flags should be optional and limited to:
@@ -411,7 +411,9 @@ Recommended baseline features:
 - 512-token sliding-window causal self-attention through the selected fast attention backend,
   with every fourth layer and the final layer using full causal attention
 - GQA support if it stays simple
+- fused QKV projection
 - SwiGLU MLP
+- fused SwiGLU gate/up projection
 - `bias=False` linear layers
 - tensor-core-friendly dimensions
 - initialization documented in `model.py`
@@ -453,33 +455,30 @@ optimizer, or training code.
 Default precision:
 
 ```python
-precision = "fp8"
+precision = "bf16"
 ```
 
-Use the repo-local tensorwise FP8 `Float8Linear` path built on PyTorch
-`torch._scaled_mm` and float8 dtypes. Do not add a torchao dependency.
-
-Use FP8 for large `nn.Linear` modules where compatible:
+Keep model parameters in bf16 for the CUDA training hot path, without separate
+FP32 master weights. Use Liger kernels for eligible fused operations:
 
 ```text
-attention projection weights
-attention output projection
-MLP projection weights
+RMSNorm
+SwiGLU activation and multiply
+LM head plus cross entropy
 ```
 
 Keep these in BF16/FP32 as appropriate:
 
 ```text
-token embeddings
-LM head (BF16 compute, not FP8)
-norms
 RoPE math
 attention softmax and masks
-cross entropy loss
-optimizer master weights and states
+small scalar/control math
 ```
 
-If local FP8 support is unavailable, fail clearly with an actionable error.
+Muon momentum and AdamW moment buffers should be bf16.
+
+If a requested Liger backend is unavailable, fail clearly with an actionable
+error.
 
 ## Optimizer
 
@@ -496,8 +495,12 @@ def create_optimizer(model, config):
 Parameter grouping must be explicit:
 
 - Muon for appropriate matrix weights:
-  - attention projection weights
-  - MLP projection weights
+  - fused QKV projection weights
+  - attention output projection weights
+  - fused MLP gate/up projection weights
+  - MLP down projection weights
+- Muon must update fused QKV and gate/up projections as row-slice virtual
+  matrices so optimizer behavior matches unfused projections.
 - AdamW for:
   - token embeddings
   - LM head
@@ -613,7 +616,6 @@ weight decay
 tokens/sec
 MFU
 BF16 MFU
-FP8 peak utilization
 peak memory
 precision mode
 kernel backends actually used
@@ -677,7 +679,6 @@ model parameter count
 scaling parameter count
 optimizer parameter grouping summary
 precision mode
-FP8 scaling configuration
 kernel backends requested
 kernel backends actually used
 torch.compile settings
@@ -698,8 +699,7 @@ git commit if available
 git diff hash if dirty
 Python version
 PyTorch version
-FP8 implementation and PyTorch float8 support
-Triton version
+Liger Kernel version
 CUDA version
 driver version
 GPU name
@@ -802,7 +802,7 @@ Expected raw formats:
 Golden command:
 
 ```bash
-python prepare_data.py all \
+uv run python prepare_data.py all \
   --input data/raw/*.txt \
   --vocab-size 32768 \
   --output data/processed
@@ -868,12 +868,13 @@ Default performance features:
 
 - `torch.compile` behind a config flag, default true for train
 - fast attention backend where available
-- local tensorwise FP8 linears by default
+- bf16 model compute by default
+- Liger RMSNorm, SwiGLU, and fused linear CE by default
 - fixed static sequence length
 - tensor-core-friendly dimensions
 
 Implement `kernels.py` as the only place where model code chooses fused or
-custom kernels. `model.py` should not import Triton directly.
+optional kernel backends. `model.py` should not import Liger directly.
 
 Backend resolution rules:
 
@@ -886,39 +887,30 @@ Backend resolution rules:
 Pay special attention to interactions among:
 
 ```text
-local FP8
+bf16 precision
 torch.compile
 fast attention
-custom Triton kernels
+Liger kernels
 Muon optimizer
 ```
 
 If two features are incompatible, fail early and explain the incompatible
 combination.
 
-## Custom Triton Kernels
+## Liger Kernels
 
-Make it easy to add custom Triton kernels without touching the rest of the repo.
+Use Liger kernels through `kernels.py` for operations where this repo has a
+direct compatible call site.
 
-Use:
-
-```text
-triton_kernels/
-  __init__.py
-  rmsnorm.py
-  cross_entropy.py
-  rope.py
-  README.md
-```
-
-Custom Triton kernels should be behind explicit config values:
+Liger backends should be behind explicit config values:
 
 ```python
-loss_backend = "triton_custom"
-rope_backend = "triton_custom"
+norm_backend = "liger"
+mlp_backend = "liger"
+loss_backend = "liger"
 ```
 
-Each custom kernel must include:
+Each Liger-backed operation must include:
 
 - a plain Torch reference implementation for tests only
 - a correctness test against the reference
@@ -946,7 +938,6 @@ Use:
 
 ```python
 L40_BF16_DENSE_PEAK = 181e12
-L40_FP8_DENSE_PEAK = 362e12
 ```
 
 MFU estimate:
@@ -955,11 +946,7 @@ MFU estimate:
 model_flops_sec = flops_per_token * tokens_per_second
 mfu = model_flops_sec / L40_BF16_DENSE_PEAK
 bf16_mfu = mfu
-fp8_peak_util = model_flops_sec / L40_FP8_DENSE_PEAK
 ```
-
-Keep `mfu` on the common BF16-peak convention, including FP8 runs. Report the
-stricter FP8 denominator separately as `fp8_peak_util`.
 
 ## Evaluation
 
@@ -1055,10 +1042,11 @@ for correctness testing only. They are not training backends.
 The basic test command should be:
 
 ```bash
-pytest
+uv run pytest
 ```
 
-On machines without CUDA, use `pytest -m "not cuda"` for portable smoke tests.
+On machines without CUDA, use `uv run pytest -m "not cuda"` for portable smoke
+tests.
 
 ## Implementation Priority
 
@@ -1078,8 +1066,7 @@ P0: fast-path runnable repo
 
 P1: fair comparison and speed defaults
   repro.py manifests
-  kernels.py with FP8/attention backend resolution and no silent fallback
-  local FP8 path
+  kernels.py with bf16/attention/Liger backend resolution and no silent fallback
   train.py with MFU
   checkpoint resume integrity
 
@@ -1091,7 +1078,6 @@ P2: useful evaluation
   baseline-vs-candidate compatibility warnings
 
 P3: extensibility
-  triton_kernels/
   kernel microbenchmarks
   optional DDP
   optional extra eval tasks

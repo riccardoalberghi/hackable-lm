@@ -18,11 +18,12 @@ def test_model_forward_and_optimizer_grouping() -> None:
         precision="fp32_test",
         compile_model=False,
         norm_backend="torch",
+        mlp_backend="torch",
         loss_backend="torch",
     )
     model = LanguageModel(cfg.model)
-    assert hasattr(model.blocks[0].mlp, "up_proj")
-    assert hasattr(model.blocks[0].mlp, "gate_proj")
+    assert hasattr(model.blocks[0].attn, "qkv_proj")
+    assert hasattr(model.blocks[0].mlp, "gate_up_proj")
     assert cfg.model.rope_fraction == 0.25
     assert model.blocks[0].attn.rope.rotary_dim == cfg.model.head_dim // 4
     mask = model.blocks[0].attn._sliding_window_mask(cfg.sequence_len, torch.device("cpu"))
@@ -41,8 +42,17 @@ def test_model_forward_and_optimizer_grouping() -> None:
     assert loss is None
     opt = create_optimizer(model, cfg)
     summary = opt.summary()
-    assert summary["muon_tensors"] > 0
+    assert summary["muon_tensors"] == 7 * cfg.model.n_layer
     assert summary["adamw_tensors"] > 0
+    split_groups = [group for group in opt.param_groups if group["kind"] == "muon" and group.get("split_sizes")]
+    assert sorted(group["split_sizes"] for group in split_groups) == [
+        (
+            cfg.model.n_head * cfg.model.head_dim,
+            cfg.model.n_kv_head * cfg.model.head_dim,
+            cfg.model.n_kv_head * cfg.model.head_dim,
+        ),
+        (cfg.model.mlp_hidden, cfg.model.mlp_hidden),
+    ]
 
 
 @requires_torch
@@ -58,6 +68,7 @@ def test_model_initialization_is_gpt_style() -> None:
         precision="fp32_test",
         compile_model=False,
         norm_backend="torch",
+        mlp_backend="torch",
         loss_backend="torch",
     )
     model = LanguageModel(cfg.model)
@@ -70,10 +81,7 @@ def test_model_initialization_is_gpt_style() -> None:
 
     assert_std_close(model.tok_emb.weight, base_std)
     assert_std_close(model.lm_head.weight, base_std)
-    assert_std_close(model.blocks[0].attn.q_proj.weight, base_std)
-    assert_std_close(model.blocks[0].attn.k_proj.weight, base_std)
-    assert_std_close(model.blocks[0].attn.v_proj.weight, base_std)
-    assert_std_close(model.blocks[0].mlp.gate_proj.weight, base_std)
-    assert_std_close(model.blocks[0].mlp.up_proj.weight, base_std)
+    assert_std_close(model.blocks[0].attn.qkv_proj.weight, base_std)
+    assert_std_close(model.blocks[0].mlp.gate_up_proj.weight, base_std)
     assert_std_close(model.blocks[0].attn.o_proj.weight, residual_std)
     assert_std_close(model.blocks[0].mlp.down_proj.weight, residual_std)

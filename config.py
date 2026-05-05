@@ -16,6 +16,8 @@ DEFAULTS = {
     "attention_full_every": 4,
     "target_param_data_ratio": 60,
     "device_batch_size": 16,
+    "auto_device_batch_memory_fraction": 0.68,
+    "auto_device_batch_max": 128,
     "reference_depth": 12,
     "reference_batch_tokens": 2**19,
     "embedding_lr_ref": 0.1,
@@ -29,13 +31,14 @@ DEFAULTS = {
     "final_lr_frac": 0.1,
     "compile_mode": "default",
     "compile_capture_scalar_outputs": True,
-    "norm_backend": "torch",
+    "norm_backend": "liger",
+    "mlp_backend": "liger",
     "loss_backend": "liger",
+    "rope_backend": "torch",
     "loss_chunk_size": 4096,
 }
 
 L40_BF16_DENSE_PEAK = 181e12
-L40_FP8_DENSE_PEAK = 362e12
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -46,10 +49,40 @@ def round_up(x: int, multiple: int) -> int:
     return ceil_div(x, multiple) * multiple
 
 
+def _pow2_floor(x: float) -> int:
+    if x <= 1:
+        return 1
+    return 2 ** int(math.floor(math.log2(x)))
+
+
 def depth_dimensions(depth: int, head_dim: int = DEFAULTS["head_dim"], layers_per_head: int = DEFAULTS["layers_per_head"]) -> tuple[int, int]:
     n_head = ceil_div(depth, layers_per_head)
     n_embd = n_head * head_dim
     return n_embd, n_head
+
+
+def auto_device_batch_size(
+    depth: int,
+    n_embd: int,
+    sequence_len: int,
+    gpu_memory_gib: float | None = None,
+    *,
+    max_batch_size: int = DEFAULTS["auto_device_batch_max"],
+    memory_fraction: float = DEFAULTS["auto_device_batch_memory_fraction"],
+) -> int:
+    shape_cap = min(max_batch_size, _pow2_floor(384 / depth))
+
+    if gpu_memory_gib is None:
+        return max(1, min(DEFAULTS["device_batch_size"], shape_cap))
+
+    gib_per_depth_width_seq_sample = 4.0e-8
+    budget_gib = max(1.0, gpu_memory_gib * memory_fraction)
+    estimated_batch = budget_gib / (
+        gib_per_depth_width_seq_sample * depth * n_embd * sequence_len
+    )
+    memory_cap = _pow2_floor(estimated_batch)
+
+    return max(1, min(shape_cap, memory_cap))
 
 
 def mlp_hidden_dim(n_embd: int) -> int:
@@ -138,9 +171,10 @@ class ModelConfig:
     attention_full_every: int | None = DEFAULTS["attention_full_every"]
     attention_backend: str = "flash_attn_2"
     norm_backend: str = DEFAULTS["norm_backend"]
+    mlp_backend: str = DEFAULTS["mlp_backend"]
     loss_backend: str = DEFAULTS["loss_backend"]
     loss_chunk_size: int = DEFAULTS["loss_chunk_size"]
-    rope_backend: str = "torch"
+    rope_backend: str = DEFAULTS["rope_backend"]
 
 
 @dataclass
@@ -174,7 +208,7 @@ class ResolvedConfig:
     estimated_flops_per_token: int
     lr_scheduler: str = DEFAULTS["lr_scheduler"]
     target_flops: float | None = None
-    precision: str = "fp8"
+    precision: str = "bf16"
     compile: bool = True
     compile_mode: str = DEFAULTS["compile_mode"]
     compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"]
@@ -210,18 +244,21 @@ def resolve_config(
     target_bytes: int | None = None,
     bytes_per_token: float | None = None,
     global_batch_tokens: int | None = None,
-    device_batch_size: int = DEFAULTS["device_batch_size"],
+    device_batch_size: int | None = None,
+    gpu_memory_gib: float | None = None,
     num_iterations: int | None = None,
     target_flops: float | None = None,
     target_time_seconds: float | None = None,
     tokens_per_second: float | None = None,
-    precision: str = "fp8",
+    precision: str = "bf16",
     compile_model: bool = True,
     compile_mode: str = DEFAULTS["compile_mode"],
     compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"],
     kernel_backend: str = "torch",
     norm_backend: str = DEFAULTS["norm_backend"],
+    mlp_backend: str = DEFAULTS["mlp_backend"],
     loss_backend: str = DEFAULTS["loss_backend"],
+    rope_backend: str = DEFAULTS["rope_backend"],
     comparison_mode: str = "same_depth",
 ) -> ResolvedConfig:
     if comparison_mode not in COMPARISON_MODES:
@@ -232,10 +269,14 @@ def resolve_config(
         raise ValueError(f"unknown compile mode {compile_mode!r}")
     if kernel_backend != "torch":
         raise ValueError(f"unknown kernel backend {kernel_backend!r}")
-    if norm_backend != "torch":
+    if norm_backend not in {"torch", "liger"}:
         raise ValueError(f"unknown norm backend {norm_backend!r}")
+    if mlp_backend not in {"torch", "liger"}:
+        raise ValueError(f"unknown MLP backend {mlp_backend!r}")
     if loss_backend not in {"torch", "liger"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
+    if rope_backend not in {"torch", "triton_qk_norm_rope"}:
+        raise ValueError(f"unknown RoPE backend {rope_backend!r}")
     budget_overrides = [num_iterations, target_tokens, target_bytes, target_flops, target_time_seconds]
     if sum(value is not None for value in budget_overrides) > 1:
         raise ValueError("choose only one budget override: num_iterations, target_tokens, target_bytes, target_flops, or target_time_seconds")
@@ -250,6 +291,14 @@ def resolve_config(
         shape_policy = "depth"
 
     n_embd, n_head = depth_dimensions(depth)
+    requested_device_batch_size = device_batch_size
+    if device_batch_size is None or device_batch_size <= 0:
+        device_batch_size = auto_device_batch_size(
+            depth,
+            n_embd,
+            sequence_len,
+            gpu_memory_gib,
+        )
     hidden = mlp_hidden_dim(n_embd)
     scaling_params = scaling_params_for_depth(depth, vocab_size)
     param_ratio_target_tokens = int(target_param_data_ratio * scaling_params)
@@ -307,7 +356,9 @@ def resolve_config(
         attention_full_every=attention_full_every,
         attention_backend="flash_attn_2",
         norm_backend=norm_backend,
+        mlp_backend=mlp_backend,
         loss_backend=loss_backend,
+        rope_backend=rope_backend,
         loss_chunk_size=DEFAULTS["loss_chunk_size"],
     )
 
@@ -358,6 +409,11 @@ def resolve_config(
         target_param_data_ratio=target_param_data_ratio,
         scheduled_tokens=scheduled_tokens,
         train_flops_budget=train_flops_budget,
+        extra={
+            "requested_device_batch_size": requested_device_batch_size,
+            "gpu_memory_gib": gpu_memory_gib,
+            "auto_device_batch_memory_fraction": DEFAULTS["auto_device_batch_memory_fraction"],
+        },
     )
 
 
@@ -381,9 +437,13 @@ def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
         model_data["attention_full_every"] = None
     model_data.setdefault("rope_fraction", 0.25)
     model_data.pop("mlp_activation", None)
-    model_data.pop("mlp_backend", None)
-    model_data["norm_backend"] = "torch"
+    if model_data.get("norm_backend") not in {"torch", "liger"}:
+        model_data["norm_backend"] = DEFAULTS["norm_backend"]
+    if model_data.get("mlp_backend") not in {"torch", "liger"}:
+        model_data["mlp_backend"] = DEFAULTS["mlp_backend"]
     model_data.setdefault("loss_backend", DEFAULTS["loss_backend"])
+    if model_data.get("rope_backend") not in {"torch", "triton_qk_norm_rope"}:
+        model_data["rope_backend"] = DEFAULTS["rope_backend"]
     model_data.setdefault("loss_chunk_size", DEFAULTS["loss_chunk_size"])
     model_data["attention_window"] = normalize_attention_window(model_data["attention_window"])
     model_data["attention_full_every"] = normalize_attention_full_every(model_data["attention_full_every"])

@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from config import config_from_dict
+from kernels import apply_precision_policy
 from model import LanguageModel
 from repro import load_trusted_checkpoint
 from tokenizer import SPECIAL_TOKENS, load_tokenizer
@@ -16,7 +17,7 @@ try:
     from lm_eval.api.model import LM
     from lm_eval.api.registry import register_model
 except ImportError as exc:  # pragma: no cover - exercised only when lm-eval is absent.
-    raise ImportError("lm_eval_simple_lm.py requires `pip install lm-eval` or an editable lm-evaluation-harness checkout") from exc
+    raise ImportError("lm_eval_simple_lm.py requires `uv sync --locked` or an editable lm-evaluation-harness checkout") from exc
 
 
 @dataclass
@@ -46,15 +47,15 @@ class SimpleLMHarness(LM):
         self._device = torch.device(device)
         self._batch_size = int(batch_size)
         self._dtype = getattr(torch, dtype) if dtype else None
+        if self._device.type == "cuda" and self._dtype not in {None, torch.bfloat16}:
+            raise RuntimeError("simple-lm checkpoints use bf16 weights on CUDA; pass dtype=bfloat16")
 
         ckpt = load_trusted_checkpoint(checkpoint, map_location="cpu")
         self._config = config_from_dict(ckpt["config"])
         self.model = LanguageModel(self._config.model)
+        self.model = apply_precision_policy(self.model, self._config.precision)
         self.model.load_state_dict(ckpt["model"])
-        if self._dtype is not None and self._device.type == "cuda":
-            self.model.to(device=self._device, dtype=self._dtype)
-        else:
-            self.model.to(self._device)
+        self.model.to(self._device)
         self.model.eval()
         if compile:
             self.model = torch.compile(self.model)

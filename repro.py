@@ -53,7 +53,7 @@ def hash_directory(
     exclude_globs: list[str] | None = None,
 ) -> str:
     root = Path(path)
-    include_globs = include_globs or ["*.py", "*.md", "*.txt", "requirements.txt", "triton_kernels/*"]
+    include_globs = include_globs or ["*.py", "*.md", "*.txt", "*.toml", "uv.lock"]
     exclude_globs = exclude_globs or ["runs/*", "data/*", "eval_data/*", "__pycache__/*", "*.pyc"]
     h = hashlib.sha256()
     for file in sorted(p for p in root.rglob("*") if p.is_file()):
@@ -103,12 +103,7 @@ def collect_environment(cwd: str | Path = ".") -> dict[str, Any]:
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
         "torch": torch_version,
-        "fp8": {
-            "implementation": "custom_scaled_mm",
-            "scaled_mm": bool(torch is not None and hasattr(torch, "_scaled_mm")),
-            "float8_dtypes": bool(torch is not None and hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e5m2")),
-        },
-        "triton": _version("triton"),
+        "liger_kernel": _version("liger_kernel"),
         "cuda": cuda,
         "gpu": gpu,
         "env": {k: os.environ.get(k) for k in env_keys if k in os.environ},
@@ -182,7 +177,6 @@ def write_run_manifest(
         "scaling_parameter_count": config.scaling_params,
         "optimizer_grouping": optimizer.summary() if hasattr(optimizer, "summary") else None,
         "precision_mode": config.precision,
-        "fp8_scaling_configuration": "custom_tensorwise_eligible_linear_modules_except_lm_head",
         "kernel_backends": kernel_info,
         "torch_compile": config.compile,
         "torch_compile_mode": config.compile_mode,

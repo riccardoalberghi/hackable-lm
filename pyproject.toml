@@ -1,0 +1,41 @@
+[project]
+name = "hackable-lm"
+version = "0.1.0"
+description = "Minimal language-model pretraining experiments."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "datasets>=4.8.5",
+    "flash-attn==2.8.3",
+    "liger-kernel>=0.8.0",
+    "lm-eval>=0.4.11",
+    "mlflow>=3.11.1",
+    "numpy>=2.4.4",
+    "tokenizers>=0.23.1",
+    "torch==2.9.1+cu128",
+    "tqdm>=4.67.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+no-build-isolation-package = [
+    "flash-attn",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

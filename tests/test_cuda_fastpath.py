@@ -12,19 +12,21 @@ from conftest import requires_cuda, requires_torch, torch
 def test_optimizer_resume_muon_state_device() -> None:
     from model import LanguageModel
     from optim import create_optimizer
+    from kernels import apply_precision_policy
 
     cfg = resolve_config(
         depth=2,
         vocab_size=128,
         sequence_len=8,
         device_batch_size=2,
-        precision="fp32_test",
+        precision="bf16",
         compile_model=False,
         norm_backend="torch",
+        mlp_backend="torch",
         loss_backend="torch",
     )
     device = torch.device("cuda")
-    model = LanguageModel(cfg.model).to(device)
+    model = apply_precision_policy(LanguageModel(cfg.model).to(device), cfg.precision)
     opt = create_optimizer(model, cfg)
     x = torch.randint(0, cfg.model.vocab_size, (2, cfg.sequence_len), device=device)
     _, loss = model(x, x)
@@ -38,7 +40,7 @@ def test_optimizer_resume_muon_state_device() -> None:
         },
         "param_groups": state["param_groups"],
     }
-    resumed_model = LanguageModel(cfg.model).to(device)
+    resumed_model = apply_precision_policy(LanguageModel(cfg.model).to(device), cfg.precision)
     resumed_opt = create_optimizer(resumed_model, cfg)
     resumed_opt.load_state_dict(moved_state)
     muon_states = [

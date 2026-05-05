@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config import resolve_config
 from conftest import requires_torch, torch
 
 
@@ -22,33 +21,13 @@ def test_chunked_linear_cross_entropy_matches_dense() -> None:
 
 
 @requires_torch
-def test_fp8_policy_keeps_lm_head_bf16_linear() -> None:
-    import fp8
+def test_bf16_precision_policy_leaves_modules_unchanged() -> None:
     import kernels
-    from model import LanguageModel
 
-    cfg = resolve_config(
-        depth=2,
-        vocab_size=128,
-        sequence_len=8,
-        device_batch_size=2,
-        precision="fp8",
-        compile_model=False,
-        norm_backend="torch",
-        loss_backend="torch",
-    )
-    model = LanguageModel(cfg.model)
-    original_supported = fp8.fp8_cuda_supported
-    fp8.fp8_cuda_supported = lambda: True
-    try:
-        model = kernels.apply_precision_policy(model, "fp8")
-    finally:
-        fp8.fp8_cuda_supported = original_supported
-
-    assert isinstance(model.blocks[0].attn.q_proj, fp8.Float8Linear)
-    assert isinstance(model.blocks[0].attn.k_proj, fp8.Float8Linear)
-    assert isinstance(model.blocks[0].attn.v_proj, fp8.Float8Linear)
-    assert not isinstance(model.lm_head, fp8.Float8Linear)
+    model = torch.nn.Sequential(torch.nn.Linear(16, 16, bias=False))
+    assert model[0].weight.dtype == torch.float32
+    assert kernels.apply_precision_policy(model, "bf16") is model
+    assert model[0].weight.dtype == torch.bfloat16
 
 
 @requires_torch
@@ -84,13 +63,62 @@ def test_flash_attention_casts_qkv_to_bfloat16() -> None:
 
 
 @requires_torch
+def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
+    import kernels
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 5, 3, 8, requires_grad=True)
+    k = torch.randn(2, 5, 2, 8, requires_grad=True)
+    freqs = torch.randn(5, 2)
+    cos = torch.cat((freqs.cos(), freqs.cos()), dim=-1)[None, :, None, :]
+    sin = torch.cat((freqs.sin(), freqs.sin()), dim=-1)[None, :, None, :]
+
+    q_out, k_out = kernels.qk_norm_rope(q, k, cos, sin, 1e-6, backend="torch")
+
+    def ref(x: torch.Tensor) -> torch.Tensor:
+        x_norm = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        x1, x2, x_pass = x_norm[..., :2], x_norm[..., 2:4], x_norm[..., 4:]
+        c = cos[..., :2]
+        s = sin[..., :2]
+        return torch.cat((x1 * c - x2 * s, x2 * c + x1 * s, x_pass), dim=-1)
+
+    q_ref = ref(q)
+    k_ref = ref(k)
+    assert torch.allclose(q_out, q_ref, atol=1e-6)
+    assert torch.allclose(k_out, k_ref, atol=1e-6)
+
+    dq = torch.randn_like(q_out)
+    dk = torch.randn_like(k_out)
+    loss = (q_out * dq).sum() + (k_out * dk).sum()
+    ref_loss = (q_ref * dq).sum() + (k_ref * dk).sum()
+    loss.backward()
+    q_grad, k_grad = q.grad.clone(), k.grad.clone()
+    q.grad = None
+    k.grad = None
+    ref_loss.backward()
+    assert torch.allclose(q_grad, q.grad, atol=1e-6)
+    assert torch.allclose(k_grad, k.grad, atol=1e-6)
+
+
+@requires_torch
 def test_kernel_resolution_and_hashing() -> None:
     from kernels import resolve_kernel_backends
     from repro import hash_directory
 
-    info = resolve_kernel_backends("torch", "fp32_test", False, norm_backend="torch", loss_backend="liger", allow_torch_backend=True)
+    info = resolve_kernel_backends(
+        "torch",
+        "fp32_test",
+        False,
+        norm_backend="liger",
+        mlp_backend="liger",
+        loss_backend="liger",
+        allow_torch_backend=True,
+    )
     assert info.actual_attention_backend in {"flash_attn_2", "torch_sdpa"}
-    assert info.actual_norm_backend == "torch"
+    assert info.actual_norm_backend in {"liger_rms_norm", "torch"}
+    assert info.actual_mlp_backend in {"liger_swiglu", "torch"}
     assert info.actual_loss_backend in {"liger_fused_linear_ce", "torch"}
+    assert info.actual_rope_backend == "torch"
     assert isinstance(info.liger_available, bool)
+    assert isinstance(info.triton_available, bool)
     assert len(hash_directory(Path.cwd())) == 64

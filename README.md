@@ -7,40 +7,44 @@ The baseline is a decoder-only causal LM with byte-level BPE tokenization,
 untied token embedding and LM head, RoPE, non-parametric RMSNorm,
 QK norm, 512-token sliding-window causal self-attention with every fourth layer
 full attention and the final layer always full attention, SwiGLU MLPs,
-`bias=False` linear layers, Muon for transformer matrix weights, and AdamW for
-embeddings, LM head, and scalar/vector parameters.
+fused QKV and fused gate/up projection matrices, `bias=False` linear layers,
+Muon for transformer matrix weights, and AdamW for embeddings, LM head, and
+scalar/vector parameters.
 
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt
+uv sync --locked
 
-python prepare_data.py all \
+uv run python prepare_data.py all \
   --input data/raw/*.txt \
   --vocab-size 32768 \
   --output data/processed
 
-python train.py \
+uv run python train.py \
   --depth 12 \
   --data data/processed \
   --run-name d12
 
 # MLflow logs are written locally by default:
 # runs/mlruns/<experiment>/<run> plus the normal runs/d12 artifacts.
-mlflow ui --backend-store-uri file://$(pwd)/runs/mlruns
+uv run mlflow ui --backend-store-uri file://$(pwd)/runs/mlruns
 
-python prepare_eval.py --source hf --output eval_data
+uv run python prepare_eval.py --source hf --output eval_data
 
-python eval.py \
+uv run python eval.py \
   --checkpoint runs/d12/checkpoints/latest.pt \
   --tasks hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq \
   --limit-per-task 128
 ```
 
+Dependencies are managed by `uv` through `pyproject.toml` and `uv.lock`. The
+lockfile targets the CUDA Linux x86_64 training path.
+
 Normal scaling uses one knob:
 
 ```bash
-python train.py --depth 20 --data data/processed --run-name d20
+uv run python train.py --depth 20 --data data/processed --run-name d20
 ```
 
 Depth is only the default shape shortcut. For follow-up comparisons, the same
@@ -48,15 +52,15 @@ resolver can hold a different quantity fixed:
 
 ```bash
 # Approximately match a previous run's scaling-parameter count.
-python train.py --target-params 150000000 --comparison-mode same_params --data data/processed --run-name p150m
+uv run python train.py --target-params 150000000 --comparison-mode same_params --data data/processed --run-name p150m
 
 # Keep the same token, byte, or FLOP budget across a candidate.
-python train.py --depth 12 --target-tokens 2000000000 --comparison-mode same_tokens --data data/processed --run-name d12_tokens
-python train.py --depth 12 --target-bytes 8000000000 --comparison-mode same_bytes --data data/processed --run-name d12_bytes
-python train.py --depth 12 --target-flops 3e19 --comparison-mode same_flops --data data/processed --run-name d12_flops
+uv run python train.py --depth 12 --target-tokens 2000000000 --comparison-mode same_tokens --data data/processed --run-name d12_tokens
+uv run python train.py --depth 12 --target-bytes 8000000000 --comparison-mode same_bytes --data data/processed --run-name d12_bytes
+uv run python train.py --depth 12 --target-flops 3e19 --comparison-mode same_flops --data data/processed --run-name d12_flops
 
 # Fill the relevant fields from an existing manifest.
-python train.py \
+uv run python train.py \
   --match-run runs/d12/manifest.json \
   --comparison-mode same_tokens \
   --depth 12 \
@@ -64,9 +68,14 @@ python train.py \
   --run-name candidate_same_tokens
 ```
 
-`train.py` is a strict fast-path script. If CUDA FP8 support or FlashAttention 2
-are missing, it fails with an install-oriented error instead of silently falling
-back.
+`train.py` is a strict fast-path script. If CUDA, FlashAttention 2, or requested
+Liger kernels are missing, it fails with an install-oriented error instead of
+silently falling back.
+
+The CUDA training path keeps model parameters and Muon/AdamW optimizer state in
+bf16. It does not maintain separate FP32 master weights.
+Muon updates fused QKV and gate/up matrices as separate row-slice virtual
+matrices, matching the optimizer behavior of unfused projections.
 
 `train.py` also logs each run to MLflow by default. The default tracking URI is
 a local file store under `--runs-dir/mlruns`, so training does not need network
@@ -108,9 +117,7 @@ steps = target_tokens // global_batch_tokens
 Every run manifest records the resolved `shape_policy`, `budget_policy`,
 `comparison_mode`, scheduled tokens, and train FLOPs budget.
 
-Training logs keep `mfu` on the standard BF16-peak denominator so FP8 and BF16
-runs are comparable by the usual convention. FP8-denominator utilization is
-reported separately as `fp8_peak_util`.
+Training logs report `mfu` on the standard BF16-peak denominator.
 
 ## Baseline Contract
 
@@ -123,7 +130,7 @@ BoolQ.
 For canonical benchmark methodology, use the EleutherAI harness adapter:
 
 ```bash
-python run_lm_eval.py \
+uv run python run_lm_eval.py \
   --checkpoint runs/<run_id>/checkpoints/latest.pt \
   --tokenizer data/<dataset>/tokenizer.json \
   --tasks hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq \
@@ -170,41 +177,41 @@ This repo intentionally keeps comparisons CLI-controlled instead of wrapping
 them in an experiment runner. A defensible manual flow is:
 
 ```bash
-python train.py \
+uv run python train.py \
   --depth 12 \
   --data data/processed \
   --run-name base_d12
 
-python train.py \
+uv run python train.py \
   --match-run runs/base_d12/manifest.json \
   --comparison-mode same_tokens \
   --data data/processed \
   --candidate-label idea_x \
   --run-name idea_x_same_tokens
 
-python repro.py compare \
+uv run python repro.py compare \
   runs/base_d12/manifest.json \
   runs/idea_x_same_tokens/manifest.json \
   --fail-on-warning
 
-python eval.py \
+uv run python eval.py \
   --checkpoint runs/base_d12/checkpoints/latest.pt \
   --tasks validation_loss,hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq \
   --data data/processed \
   --eval-data eval_data
 
-python eval.py \
+uv run python eval.py \
   --checkpoint runs/idea_x_same_tokens/checkpoints/latest.pt \
   --tasks validation_loss,hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq \
   --data data/processed \
   --eval-data eval_data
 
-python run_lm_eval.py \
+uv run python run_lm_eval.py \
   --checkpoint runs/base_d12/checkpoints/latest.pt \
   --tokenizer data/processed/tokenizer.json \
   --output runs/base_d12/eval/lm_eval_results.json
 
-python run_lm_eval.py \
+uv run python run_lm_eval.py \
   --checkpoint runs/idea_x_same_tokens/checkpoints/latest.pt \
   --tokenizer data/processed/tokenizer.json \
   --output runs/idea_x_same_tokens/eval/lm_eval_results.json
@@ -228,8 +235,7 @@ intentional non-paper debugging.
 - `tokenizer.py`: tokenizer training/loading/encoding boundary
 - `prepare_data.py`: raw text/jsonl to token memmaps
 - `data.py`: static-shape packed-token memmap batches
-- `fp8.py`: local tensorwise FP8 linear layers built on `torch._scaled_mm`
-- `kernels.py`: FP8 policy, FlashAttention 2, Liger fused linear CE, compile, and backend resolution
+- `kernels.py`: bf16 precision policy, FlashAttention 2, Liger RMSNorm/SwiGLU/fused linear CE, compile, and backend resolution
 - `train.py`: pretraining loop, logging, validation, checkpointing
 - `prepare_eval.py`, `eval_tasks.py`, `eval.py`: local inspectable eval suite
 - `repro.py`: seeds, hashes, environment, manifests, comparison warnings
@@ -244,22 +250,22 @@ local by default and records config, manifest fields, metrics, JSONL logs, final
 metadata, and the latest checkpoint into `runs/mlruns`.
 
 The commands that can require internet are explicit data acquisition paths:
-`python prepare_eval.py --source hf ...` downloads validation splits through
+`uv run python prepare_eval.py --source hf ...` downloads validation splits through
 Hugging Face `datasets`, and `run_lm_eval.py` may need cached or downloadable
 benchmark data from the external harness. For sealed environments, prepare
 `data/processed` and `eval_data` ahead of time, then copy those directories and
-the Python wheel/cache dependencies into the runtime environment.
+the `uv` wheel/cache dependencies into the runtime environment.
 
 ## Tests
 
 ```bash
-pytest
+uv run pytest
 ```
 
 On a non-CUDA machine, run the portable smoke tests only:
 
 ```bash
-pytest -m "not cuda"
+uv run pytest -m "not cuda"
 ```
 
 Tests use explicit CPU/Torch smoke paths and are not a training fallback.

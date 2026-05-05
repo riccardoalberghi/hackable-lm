@@ -10,6 +10,7 @@ import torch
 from config import config_from_dict
 from data import MemmapDataLoader
 from eval_tasks import evaluate_task, load_jsonl
+from kernels import apply_precision_policy
 from model import LanguageModel
 from repro import hash_file, load_trusted_checkpoint
 from tokenizer import load_tokenizer
@@ -63,6 +64,7 @@ def main() -> None:
     ckpt = load_trusted_checkpoint(args.checkpoint, map_location="cpu")
     config = config_from_dict(ckpt["config"])
     model = LanguageModel(config.model).to(device)
+    model = apply_precision_policy(model, config.precision)
     model.load_state_dict(ckpt["model"])
     model.eval()
     manifest = ckpt.get("run_manifest", {})
