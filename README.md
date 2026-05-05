@@ -71,6 +71,8 @@ uv run python train.py \
 `train.py` is a strict fast-path script. If CUDA, FlashAttention 2, or requested
 Liger kernels are missing, it fails with an install-oriented error instead of
 silently falling back.
+For a quick overfit sanity check, pass `--overfit-first-batch` to repeatedly
+train on the first sampled training batch.
 
 The CUDA training path keeps model parameters and Muon/AdamW optimizer state in
 bf16. It does not maintain separate FP32 master weights.

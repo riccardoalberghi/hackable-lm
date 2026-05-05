@@ -155,6 +155,20 @@ def _log_mlflow_metrics(mlflow, record: dict[str, Any], *, step: int, prefix: st
         mlflow.log_metrics(metrics, step=step)
 
 
+def training_data_info(loader: MemmapDataLoader, *, overfit_first_batch: bool) -> dict[str, Any]:
+    info = loader.info()
+    info["overfit_first_batch"] = overfit_first_batch
+    if overfit_first_batch:
+        info["sampling_policy"] = "repeat_first_random_packed_spans_batch"
+    return info
+
+
+def next_train_batch(prefetcher, fixed_batch):
+    if fixed_batch is not None:
+        return fixed_batch
+    return prefetcher.next()
+
+
 def _start_mlflow(args, run_dir: Path, manifest: dict):
     if args.no_mlflow:
         return None
@@ -323,6 +337,11 @@ def main() -> None:
     parser.add_argument("--mlflow-tracking-uri", help="MLflow tracking URI; defaults to local file store under --runs-dir/mlruns")
     parser.add_argument("--mlflow-experiment", default="hackable-lm")
     parser.add_argument("--mlflow-run-name", help="override the MLflow run name; defaults to --run-name")
+    parser.add_argument(
+        "--overfit-first-batch",
+        action="store_true",
+        help="debug sanity check: repeatedly train on the first sampled training batch",
+    )
     args = parser.parse_args()
 
     matched_manifest = load_run_manifest_arg(args.match_run) if args.match_run else None
@@ -420,7 +439,7 @@ def main() -> None:
             config,
             raw_model,
             optimizer,
-            loader.info(),
+            training_data_info(loader, overfit_first_batch=args.overfit_first_batch),
             tokenizer_manifest(Path(args.data) / "tokenizer.json"),
             run_id=args.run_name,
             argv=sys.argv,
@@ -457,6 +476,7 @@ def main() -> None:
     if ddp["enabled"]:
         model = DistributedDataParallel(model, device_ids=[int(ddp["local_rank"])], output_device=int(ddp["local_rank"]))
     train_prefetcher = loader.cuda_prefetcher("train", config.device_batch_size, device)
+    fixed_train_batch = train_prefetcher.next() if args.overfit_first_batch else None
     train_log = (run_dir / "train_log.jsonl").open("a", encoding="utf-8") if is_main else None
     torch.cuda.reset_peak_memory_stats()
     train_start_time = time.perf_counter()
@@ -477,11 +497,12 @@ def main() -> None:
                     else model.no_sync()
                 )
                 with sync_context:
-                    x, y = train_prefetcher.next()
+                    x, y = next_train_batch(train_prefetcher, fixed_train_batch)
                     mark_compiled_step_begin(config.compile)
                     _, loss = model(x, y)
                     (loss / config.gradient_accumulation_steps).backward()
-                    train_prefetcher.preload()
+                    if fixed_train_batch is None:
+                        train_prefetcher.preload()
                     if log_this_step:
                         detached_loss = loss.detach()
                         total_loss = detached_loss if total_loss is None else total_loss + detached_loss
@@ -527,6 +548,7 @@ def main() -> None:
                     "run_id": args.run_name,
                     "seed": args.seed,
                     "data_hash": data_manifest["tokenizer_hash"],
+                    "overfit_first_batch": args.overfit_first_batch,
                 }
                 if step % args.val_interval == 0 and step != start_step:
                     record["val_loss"] = validate(raw_model, loader, config, device, args.val_batches)
