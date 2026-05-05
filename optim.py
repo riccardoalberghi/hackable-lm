@@ -54,20 +54,19 @@ def muon_step_fused(
     momentum = momentum_t.to(momentum_buffer.dtype)
     momentum_buffer.lerp_(stacked_grads, 1.0 - momentum)
 
-    x = momentum_buffer.bfloat16()
-    if x.size(-2) > x.size(-1):
-        x = x.mT
-        transposed = True
-    else:
-        transposed = False
+    x = stacked_grads.to(momentum_buffer.dtype).lerp(momentum_buffer, momentum).bfloat16()
     x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     a, b, c = 3.4445, -4.7750, 2.0315
-    for _ in range(5):
-        xx_t = x @ x.mT
-        poly = torch.baddbmm(xx_t, xx_t, xx_t, beta=b, alpha=c)
-        x = torch.baddbmm(x, poly, x, beta=a)
-    if transposed:
-        x = x.mT
+    if x.size(-2) > x.size(-1):
+        for _ in range(5):
+            x_t_x = x.mT @ x
+            poly = torch.baddbmm(x_t_x, x_t_x, x_t_x, beta=b, alpha=c)
+            x = torch.baddbmm(x, x, poly, beta=a)
+    else:
+        for _ in range(5):
+            xx_t = x @ x.mT
+            poly = torch.baddbmm(xx_t, xx_t, xx_t, beta=b, alpha=c)
+            x = torch.baddbmm(x, poly, x, beta=a)
 
     update = x.to(stacked_params.dtype)
     lr = lr_t.to(stacked_params.dtype)
