@@ -100,10 +100,23 @@ def load_run_manifest_arg(path: str) -> dict:
 
 
 def infer_bytes_per_token(data_manifest: dict) -> float | None:
+    val_bytes = data_manifest.get("val_text_bytes")
+    val_tokens = data_manifest.get("val_tokens")
+    if val_bytes and val_tokens:
+        return val_bytes / val_tokens
     sizes = data_manifest.get("raw_input_file_sizes") or {}
     tokens = data_manifest.get("train_tokens", 0) + data_manifest.get("val_tokens", 0)
     raw_bytes = sum(sizes.values())
+    if not tokens or not raw_bytes:
+        return None
     return raw_bytes / tokens
+
+
+def estimate_bits_per_byte(loss_nats: float, data_manifest: dict) -> float | None:
+    bytes_per_token = infer_bytes_per_token(data_manifest)
+    if bytes_per_token is None or bytes_per_token <= 0:
+        return None
+    return loss_nats / np.log(2.0) / bytes_per_token
 
 
 def _flatten_for_mlflow(obj: Any, prefix: str = "") -> dict[str, Any]:
@@ -153,6 +166,44 @@ def _log_mlflow_metrics(mlflow, record: dict[str, Any], *, step: int, prefix: st
             metrics[f"{prefix}.{key}"] = float(value)
     if metrics:
         mlflow.log_metrics(metrics, step=step)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return "0m"
+    minutes = int(round(seconds / 60))
+    days, rem_minutes = divmod(minutes, 24 * 60)
+    hours, mins = divmod(rem_minutes, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def format_train_record(record: dict[str, Any], total_steps: int) -> str:
+    step = int(record["step"])
+    loss = float(record["loss"])
+    tokens_seen = int(record["tokens_seen"])
+    tokens_sec = float(record["tokens_sec"])
+    mfu = float(record["mfu"])
+    lr_mult = float(record["lr_multiplier"])
+    grad_norm = float(record["grad_norm"])
+    eta = format_duration((total_steps - step - 1) * tokens_seen / (step + 1) / tokens_sec) if tokens_sec > 0 else "?"
+    parts = [
+        f"step {step:>5}/{total_steps - 1}",
+        f"loss {loss:7.4f}",
+        f"lr {lr_mult:5.3f}",
+        f"gn {grad_norm:6.3f}",
+        f"{tokens_sec / 1000:>4.0f}k tok/s",
+        f"mfu {mfu * 100:5.1f}%",
+        f"eta {eta:>7}",
+    ]
+    if "val_loss" in record:
+        parts.append(f"val {float(record['val_loss']):7.4f}")
+    if "val_bpb" in record:
+        parts.append(f"bpb {float(record['val_bpb']):5.3f}")
+    return " | ".join(parts)
 
 
 def training_data_info(loader: MemmapDataLoader, *, overfit_first_batch: bool) -> dict[str, Any]:
@@ -538,8 +589,11 @@ def main() -> None:
                 }
                 if step % args.val_interval == 0 and step != start_step:
                     record["val_loss"] = validate(raw_model, loader, config, device, args.val_batches)
+                    val_bpb = estimate_bits_per_byte(record["val_loss"], data_manifest)
+                    if val_bpb is not None:
+                        record["val_bpb"] = val_bpb
                     last_val_loss = record["val_loss"]
-                print(json.dumps(record), flush=True)
+                print(format_train_record(record, config.num_iterations), flush=True)
                 train_log.write(json.dumps(record) + "\n")
                 train_log.flush()
                 last_train_record = record

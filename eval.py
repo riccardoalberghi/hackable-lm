@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +15,26 @@ from kernels import apply_precision_policy
 from model import LanguageModel
 from repro import hash_file, load_trusted_checkpoint
 from tokenizer import load_tokenizer
+
+
+def infer_bytes_per_token(data_manifest: dict) -> float | None:
+    val_bytes = data_manifest.get("val_text_bytes")
+    val_tokens = data_manifest.get("val_tokens")
+    if val_bytes and val_tokens:
+        return val_bytes / val_tokens
+    sizes = data_manifest.get("raw_input_file_sizes") or {}
+    tokens = data_manifest.get("train_tokens", 0) + data_manifest.get("val_tokens", 0)
+    raw_bytes = sum(sizes.values())
+    if not tokens or not raw_bytes:
+        return None
+    return raw_bytes / tokens
+
+
+def estimate_bits_per_byte(loss_nats: float, data_manifest: dict) -> float | None:
+    bytes_per_token = infer_bytes_per_token(data_manifest)
+    if bytes_per_token is None or bytes_per_token <= 0:
+        return None
+    return loss_nats / math.log(2.0) / bytes_per_token
 
 
 def load_eval_manifest(eval_data: str | Path) -> dict:
@@ -79,7 +100,13 @@ def main() -> None:
                 raise ValueError("--data is required for validation_loss")
             loader = MemmapDataLoader(args.data, config.sequence_len, seed=args.seed)
             value = validation_loss(model, loader, device, batches=16, batch_size=min(4, config.device_batch_size))
-            results.append({"task": task, "metric": "loss", "value": value, "n": 16, "details": {}})
+            data_manifest = loader.manifest
+            details = {}
+            val_bpb = estimate_bits_per_byte(value, data_manifest)
+            if val_bpb is not None:
+                details["bits_per_byte"] = val_bpb
+                details["bytes_per_token"] = infer_bytes_per_token(data_manifest)
+            results.append({"task": task, "metric": "loss", "value": value, "n": 16, "details": details})
             continue
         path = Path(args.eval_data) / f"{task}.jsonl"
         examples = load_jsonl(path)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from conftest import requires_torch
@@ -30,3 +31,16 @@ def test_eval_task_file_provenance(tmp_path: Path) -> None:
     assert sorted(provenance) == ["boolq"]
     assert provenance["boolq"]["sha256"] == manifest["tasks"]["boolq"]["sha256"]
     assert provenance["boolq"]["examples"] == 2
+
+
+def test_validation_bpb_uses_val_text_bytes() -> None:
+    from eval import estimate_bits_per_byte
+
+    manifest = {
+        "raw_input_file_sizes": {"raw.jsonl": 10_000},
+        "train_tokens": 100,
+        "val_tokens": 10,
+        "train_text_bytes": 300,
+        "val_text_bytes": 20,
+    }
+    assert math.isclose(estimate_bits_per_byte(math.log(2.0), manifest), 0.5)

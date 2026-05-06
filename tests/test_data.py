@@ -19,6 +19,8 @@ def test_preprocess_and_memmap(tmp_path: Path) -> None:
     manifest = prepare_all([str(raw)], out, vocab_size=128, val_fraction=0.2, min_frequency=1)
     assert (out / "train.bin").exists()
     assert manifest["train_tokens"] > 16
+    assert manifest["train_text_bytes"] > 0
+    assert manifest["val_text_bytes"] > 0
     loader = MemmapDataLoader(out, block_size=8, seed=123)
     x, y = loader.get_batch("train", 4, "cpu")
     assert x.shape == y.shape == (4, 8)

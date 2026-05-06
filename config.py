@@ -33,7 +33,7 @@ DEFAULTS = {
     "compile_mode": "default",
     "compile_capture_scalar_outputs": True,
     "loss_backend": "liger",
-    "rope_backend": "torch",
+    "rope_backend": "triton",
     "loss_chunk_size": 4096,
 }
 

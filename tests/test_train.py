@@ -34,6 +34,27 @@ def test_training_data_info_marks_first_batch_overfit() -> None:
 
 
 @requires_torch
+def test_format_train_record_keeps_common_columns_aligned() -> None:
+    from train import format_train_record
+
+    base = {
+        "loss": 5.4991,
+        "tokens_seen": 50_000_000,
+        "tokens_sec": 101_000,
+        "mfu": 0.422,
+        "lr_multiplier": 0.481,
+        "grad_norm": 1.078,
+    }
+    train_only = format_train_record({"step": 90, **base}, 4200)
+    with_val = format_train_record({"step": 100, **base, "val_loss": 5.5012, "val_bpb": 1.8}, 4200)
+
+    assert [idx for idx, char in enumerate(train_only) if char == "|"] == [16, 31, 42, 54, 67, 80]
+    assert [idx for idx, char in enumerate(with_val) if char == "|"][:6] == [16, 31, 42, 54, 67, 80]
+    assert train_only.split(" | ")[1:6] == with_val.split(" | ")[1:6]
+    assert with_val.endswith(" | val  5.5012 | bpb 1.800")
+
+
+@requires_torch
 def test_next_train_batch_reuses_fixed_batch_without_advancing_prefetcher() -> None:
     from train import next_train_batch
 
