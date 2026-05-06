@@ -73,3 +73,17 @@ def test_next_train_batch_reuses_fixed_batch_without_advancing_prefetcher() -> N
     assert next_train_batch(prefetcher, fixed) == fixed
     assert prefetcher.calls == 0
     assert next_train_batch(prefetcher, None) == ("fresh", 1)
+
+
+@requires_torch
+def test_grad_global_norm_reports_without_clipping() -> None:
+    import torch
+
+    from train import grad_global_norm
+
+    p1 = torch.nn.Parameter(torch.zeros(2))
+    p2 = torch.nn.Parameter(torch.zeros(2))
+    p1.grad = torch.tensor([3.0, 4.0])
+    p2.grad = torch.tensor([0.0, 12.0])
+
+    assert torch.isclose(grad_global_norm([p1, p2]), torch.tensor(13.0))

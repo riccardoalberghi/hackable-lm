@@ -161,6 +161,7 @@ def write_run_manifest(
     seed: int,
     kernel_info: dict[str, Any],
     label: str | None = None,
+    max_grad_norm: float = 0.0,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +186,10 @@ def write_run_manifest(
         "microbatch_size": config.device_batch_size,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
         "total_gradient_accumulation_steps": config.total_gradient_accumulation_steps,
+        "gradient_clipping": {
+            "enabled": max_grad_norm > 0,
+            "max_norm": max_grad_norm,
+        },
         "world_size": config.world_size,
         "scheduled_tokens": config.scheduled_tokens,
         "train_flops_budget": config.train_flops_budget,

@@ -220,6 +220,19 @@ def next_train_batch(prefetcher, fixed_batch):
     return prefetcher.next()
 
 
+@torch.no_grad()
+def grad_global_norm(parameters: list[torch.nn.Parameter], norm_type: float = 2.0) -> torch.Tensor:
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+    get_total_norm = getattr(torch.nn.utils, "get_total_norm", None)
+    if get_total_norm is not None:
+        return get_total_norm(grads, norm_type=norm_type, foreach=True)
+    device = grads[0].device
+    norms = torch.stack([torch.linalg.vector_norm(grad.detach(), ord=norm_type).to(device) for grad in grads])
+    return torch.linalg.vector_norm(norms, ord=norm_type)
+
+
 def _start_mlflow(args, run_dir: Path, manifest: dict):
     if args.no_mlflow:
         return None
@@ -368,7 +381,7 @@ def main() -> None:
     parser.add_argument("--val-interval", type=int, default=100)
     parser.add_argument("--val-batches", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="clip gradients to this norm; set <= 0 to disable clipping")
+    parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
     parser.add_argument("--loss-backend", choices=["torch", "liger"])
     parser.add_argument("--rope-backend", choices=["torch", "triton"])
@@ -483,6 +496,7 @@ def main() -> None:
             seed=args.seed,
             kernel_info=kernel_info,
             label=args.candidate_label,
+            max_grad_norm=args.max_grad_norm,
         )
     if ddp["enabled"]:
         manifest_box = [manifest]
@@ -546,7 +560,7 @@ def main() -> None:
             if args.max_grad_norm > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, args.max_grad_norm, foreach=True)
             else:
-                grad_norm = float("nan")
+                grad_norm = grad_global_norm(clip_params)
             lr_mult = lr_multiplier(step, config.num_iterations, config.warmup_steps, config.warmdown_ratio, config.final_lr_frac, config.lr_scheduler)
             optimizer.set_lr_multiplier(lr_mult)
             optimizer.step()
