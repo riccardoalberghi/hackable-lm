@@ -55,6 +55,40 @@ def test_format_train_record_keeps_common_columns_aligned() -> None:
 
 
 @requires_torch
+def test_format_timing_record_summarizes_phase_ms() -> None:
+    from train import format_timing_record, should_time_step
+
+    class Args:
+        timing_interval = 5
+        timing_warmup = 10
+
+    assert should_time_step(9, Args()) is False
+    assert should_time_step(10, Args()) is True
+    assert should_time_step(11, Args()) is False
+    timing = {
+        "step": 10,
+        "total_ms": 100.0,
+        "phase_ms": {
+            "zero_grad": 1.0,
+            "data_wait": 2.0,
+            "forward_backward": 80.0,
+            "prefetch": 3.0,
+            "grad_norm": 4.0,
+            "lr_update": 0.5,
+            "optimizer": 6.0,
+        },
+        "unaccounted_ms": 3.5,
+    }
+
+    line = format_timing_record(timing)
+
+    assert line.startswith("timing step    10 | total   100.0ms")
+    assert "fb   80.0ms 80.0%" in line
+    assert "opt    6.0ms  6.0%" in line
+    assert line.endswith("other    3.5ms  3.5%")
+
+
+@requires_torch
 def test_next_train_batch_reuses_fixed_batch_without_advancing_prefetcher() -> None:
     from train import next_train_batch
 
