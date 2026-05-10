@@ -1,5 +1,9 @@
 __pycache__/
 *.py[cod]
+_simple_lm_tokenizer*.so
+_simple_lm_tokenizer*.pyd
+_simple_lm_tokenizer*.dylib
+rustbpe/target/
 
 .DS_Store
 .venv/

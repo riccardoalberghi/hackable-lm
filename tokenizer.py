@@ -4,17 +4,10 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+from _rustbpe import Tokenizer, load_from_file, train_from_iterator
+
 SPECIAL_TOKENS = ["<|endoftext|>"]
-
-
-def _require_tokenizers():
-    from tokenizers import Tokenizer
-    from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import ByteLevel
-    from tokenizers.processors import ByteLevel as ByteLevelProcessor
-    from tokenizers.trainers import BpeTrainer
-
-    return Tokenizer, BPE, ByteLevel, ByteLevelProcessor, BpeTrainer
+TOKENIZER_BACKEND = "simple_lm_rustbpe_bytelevel"
 
 
 def iter_texts(paths: Iterable[str | Path], jsonl_text_field: str = "text") -> Iterable[str]:
@@ -42,20 +35,19 @@ def train_tokenizer(
     jsonl_text_field: str = "text",
     min_frequency: int = 2,
 ) -> None:
-    Tokenizer, BPE, ByteLevel, ByteLevelProcessor, BpeTrainer = _require_tokenizers()
-    tokenizer = Tokenizer(BPE(unk_token=None))
-    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
-    tokenizer.post_processor = ByteLevelProcessor(trim_offsets=False)
-    trainer = BpeTrainer(vocab_size=vocab_size, min_frequency=min_frequency, special_tokens=SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(iter_texts(input_paths, jsonl_text_field), trainer=trainer)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tokenizer.save(str(output_path))
+    train_from_iterator(
+        iter_texts(input_paths, jsonl_text_field),
+        str(output_path),
+        vocab_size,
+        min_frequency,
+        SPECIAL_TOKENS,
+    )
 
 
-def load_tokenizer(path: str | Path):
-    Tokenizer, *_ = _require_tokenizers()
-    return Tokenizer.from_file(str(path))
+def load_tokenizer(path: str | Path) -> Tokenizer:
+    return load_from_file(str(path))
 
 
 def encode(tokenizer, text: str, add_eos: bool = True) -> list[int]:
@@ -80,5 +72,5 @@ def tokenizer_manifest(path: str | Path) -> dict:
         "tokenizer_hash": hash_file(path),
         "vocab_size": tok.get_vocab_size(),
         "special_tokens": SPECIAL_TOKENS,
-        "backend": "huggingface_tokenizers_bpe_bytelevel",
+        "backend": TOKENIZER_BACKEND,
     }

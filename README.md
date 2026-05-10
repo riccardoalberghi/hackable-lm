@@ -39,7 +39,9 @@ uv run python eval.py \
 ```
 
 Dependencies are managed by `uv` through `pyproject.toml` and `uv.lock`. The
-lockfile targets the CUDA Linux x86_64 training path.
+lockfile targets the CUDA Linux x86_64 training path. Tokenization uses the
+local Rust backend in `rustbpe/`, so `cargo` must be available when the native
+extension needs to be built or rebuilt.
 
 Normal scaling uses one knob:
 

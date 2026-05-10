@@ -53,8 +53,8 @@ def hash_directory(
     exclude_globs: list[str] | None = None,
 ) -> str:
     root = Path(path)
-    include_globs = include_globs or ["*.py", "*.md", "*.txt", "*.toml", "uv.lock"]
-    exclude_globs = exclude_globs or ["runs/*", "data/*", "eval_data/*", "__pycache__/*", "*.pyc"]
+    include_globs = include_globs or ["*.py", "*.rs", "*.sh", "*.md", "*.txt", "*.toml", "Cargo.lock", "uv.lock"]
+    exclude_globs = exclude_globs or ["runs/*", "data/*", "eval_data/*", "*/target/*", "__pycache__/*", "*.pyc"]
     h = hashlib.sha256()
     for file in sorted(p for p in root.rglob("*") if p.is_file()):
         rel = file.relative_to(root).as_posix()
@@ -227,7 +227,9 @@ BASE_COMPARISON_FIELDS = [
     ("optimizer_grouping", "optimizer grouping"),
     ("lr_schedule", "LR schedule"),
     ("seed", "seed"),
+    ("data.manifest.tokenizer_backend", "tokenizer backend"),
     ("data.manifest.tokenizer_hash", "tokenizer hash"),
+    ("data.manifest.preprocessing", "preprocessing"),
     ("data.manifest.raw_input_sha256", "data hashes"),
     ("data.manifest.split_seed", "train/val split seed"),
 ]

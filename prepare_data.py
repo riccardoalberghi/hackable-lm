@@ -9,7 +9,14 @@ from typing import Iterable
 import numpy as np
 
 from repro import hash_file
-from tokenizer import SPECIAL_TOKENS, iter_texts, load_tokenizer, train_tokenizer, tokenizer_manifest
+from tokenizer import (
+    SPECIAL_TOKENS,
+    TOKENIZER_BACKEND,
+    iter_texts,
+    load_tokenizer,
+    tokenizer_manifest,
+    train_tokenizer,
+)
 
 
 def expand_inputs(patterns: list[str]) -> list[Path]:
@@ -154,8 +161,10 @@ def prepare_all(
         "raw_input_sha256": {str(p): hash_file(p) for p in input_paths},
         "tokenizer_hash": tok_info["tokenizer_hash"],
         "tokenizer_path": str(tokenizer_path),
+        "tokenizer_backend": tok_info["backend"],
         "vocab_size": tok_info["vocab_size"],
         "requested_vocab_size": vocab_size,
+        "min_frequency": min_frequency,
         "special_tokens": SPECIAL_TOKENS,
         "split_seed": split_seed,
         "split_policy": "streaming_document_bernoulli",
@@ -167,7 +176,7 @@ def prepare_all(
         "dtype": dtype_name,
         "jsonl_text_field": jsonl_text_field,
         "tokenize_batch_size": batch_size,
-        "preprocessing": "bytelevel_bpe_packed_contiguous",
+        "preprocessing": f"{TOKENIZER_BACKEND}_packed_contiguous",
         "prepare_data_code_hash": hash_file(Path(__file__)),
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
