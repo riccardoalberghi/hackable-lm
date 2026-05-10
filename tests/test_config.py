@@ -21,13 +21,13 @@ def test_config_derivation() -> None:
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
     assert DEFAULTS["lr_depth_stability_reference"] == 6
-    assert DEFAULTS["loss_backend"] == "liger"
+    assert DEFAULTS["loss_backend"] == "triton"
     assert DEFAULTS["rope_backend"] == "triton"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
-    assert default_cfg.model.loss_backend == "liger"
+    assert default_cfg.model.loss_backend == "triton"
     assert default_cfg.model.rope_backend == "triton"
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
     assert pattern == [512, 512, 512, None, 512, 512, 512, None]

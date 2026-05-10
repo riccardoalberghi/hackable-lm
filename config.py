@@ -32,7 +32,7 @@ DEFAULTS = {
     "final_lr_frac": 0.1,
     "compile_mode": "default",
     "compile_capture_scalar_outputs": True,
-    "loss_backend": "liger",
+    "loss_backend": "triton",
     "rope_backend": "triton",
     "loss_chunk_size": 4096,
 }
@@ -264,7 +264,7 @@ def resolve_config(
         raise ValueError(f"unknown compile mode {compile_mode!r}")
     if kernel_backend != "torch":
         raise ValueError(f"unknown kernel backend {kernel_backend!r}")
-    if loss_backend not in {"torch", "liger"}:
+    if loss_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
     if rope_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown RoPE backend {rope_backend!r}")
@@ -432,7 +432,7 @@ def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
     model_data.setdefault("rope_fraction", 0.25)
     model_data.pop("mlp_activation", None)
     model_data.setdefault("loss_backend", DEFAULTS["loss_backend"])
-    if model_data.get("loss_backend") not in {"torch", "liger"}:
+    if model_data.get("loss_backend") not in {"torch", "triton"}:
         model_data["loss_backend"] = DEFAULTS["loss_backend"]
     if model_data.get("rope_backend") not in {"torch", "triton"}:
         model_data["rope_backend"] = DEFAULTS["rope_backend"]

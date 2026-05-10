@@ -7,7 +7,6 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "datasets>=4.8.5",
     "flash-attn==2.8.3",
-    "liger-kernel>=0.8.0",
     "lm-eval>=0.4.11",
     "mlflow>=3.11.1",
     "numpy>=2.4.4",

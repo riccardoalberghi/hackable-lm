@@ -6,17 +6,20 @@ from conftest import requires_torch, torch
 
 
 @requires_torch
-def test_chunked_linear_cross_entropy_matches_dense() -> None:
+def test_linear_cross_entropy_torch_path_matches_dense() -> None:
     import torch.nn.functional as F
 
-    import kernels
+    from config import resolve_config
+    from model import LinearCrossEntropyLoss
 
     torch.manual_seed(0)
-    head = torch.nn.Linear(16, 33, bias=False)
+    cfg = resolve_config(depth=2, vocab_size=33, sequence_len=7, precision="fp32_test", compile_model=False, loss_backend="torch")
+    loss_fn = LinearCrossEntropyLoss(cfg.model)
+    weight = torch.randn(33, 16, requires_grad=True)
     hidden = torch.randn(3, 7, 16, requires_grad=True)
     targets = torch.randint(0, 33, (3, 7))
-    dense = F.cross_entropy(head(hidden).float().reshape(-1, 33), targets.reshape(-1))
-    chunked = kernels.chunked_linear_cross_entropy(hidden, head, targets, chunk_size=5)
+    dense = F.cross_entropy(F.linear(hidden, weight).float().reshape(-1, 33), targets.reshape(-1))
+    chunked = loss_fn(hidden, weight, None, targets)
     assert torch.allclose(chunked, dense, atol=1e-6)
 
 
@@ -65,15 +68,19 @@ def test_flash_attention_casts_qkv_to_bfloat16() -> None:
 @requires_torch
 def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
     import kernels
+    from config import resolve_config
+    from model import QKNormRoPE
 
     torch.manual_seed(0)
+    cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="torch")
+    qk_norm_rope = QKNormRoPE(cfg.model)
     q = torch.randn(2, 5, 3, 8, requires_grad=True)
     k = torch.randn(2, 5, 2, 8, requires_grad=True)
     freqs = torch.randn(5, 2)
     cos = torch.cat((freqs.cos(), freqs.cos()), dim=-1)[None, :, None, :]
     sin = torch.cat((freqs.sin(), freqs.sin()), dim=-1)[None, :, None, :]
 
-    q_out, k_out = kernels.qk_norm_rope(q, k, cos, sin, 1e-6, backend="torch")
+    q_out, k_out = qk_norm_rope(q, k, cos.transpose(1, 2), sin.transpose(1, 2))
 
     def ref(x: torch.Tensor) -> torch.Tensor:
         x_norm = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
@@ -86,7 +93,7 @@ def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
     k_ref = ref(k)
     assert torch.allclose(q_out, q_ref, atol=1e-6)
     assert torch.allclose(k_out, k_ref, atol=1e-6)
-    q_triton_cpu, k_triton_cpu = kernels.qk_norm_rope(q, k, cos, sin, 1e-6, backend="triton")
+    q_triton_cpu, k_triton_cpu = kernels.qk_norm_rope_triton(q, k, cos, sin, 1e-6)
     assert torch.allclose(q_triton_cpu, q_ref, atol=1e-6)
     assert torch.allclose(k_triton_cpu, k_ref, atol=1e-6)
 
@@ -112,24 +119,23 @@ def test_kernel_resolution_and_hashing() -> None:
         "torch",
         "fp32_test",
         False,
-        loss_backend="liger",
+        loss_backend="triton",
         allow_torch_backend=True,
     )
     assert info.actual_attention_backend in {"flash_attn_2", "torch_sdpa"}
     assert info.actual_norm_backend == "torch"
     assert info.actual_mlp_backend == "torch"
-    assert info.actual_loss_backend in {"liger_fused_linear_ce", "torch"}
+    assert info.actual_loss_backend in {"triton_fused_linear_ce", "torch"}
     assert info.actual_rope_backend == "torch"
-    assert isinstance(info.liger_available, bool)
     assert isinstance(info.triton_available, bool)
     rope_info = resolve_kernel_backends(
         "torch",
         "fp32_test",
         False,
-        loss_backend="liger",
+        loss_backend="triton",
         rope_backend="triton",
         allow_torch_backend=True,
     )
-    assert rope_info.actual_loss_backend in {"liger_fused_linear_ce", "torch"}
+    assert rope_info.actual_loss_backend in {"triton_fused_linear_ce", "torch"}
     assert rope_info.actual_rope_backend in {"triton", "torch"}
     assert len(hash_directory(Path.cwd())) == 64

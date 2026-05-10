@@ -11,6 +11,33 @@ import kernels
 from config import ModelConfig, layer_attention_window
 
 
+def rms_norm_torch(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
+    y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return y if weight is None else y * weight
+
+
+class AcceleratedModule(nn.Module):
+    backend_attr: str | None = None
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+
+    def selected_backend(self) -> str:
+        if self.backend_attr is None:
+            return "torch"
+        return getattr(self.config, self.backend_attr, "torch")
+
+    def forward(self, *args, **kwargs):
+        backend = self.selected_backend()
+        if backend == "torch":
+            return self.fwd_torch(*args, **kwargs)
+        fwd_backend = getattr(self, f"fwd_{backend}", None)
+        if fwd_backend is None:
+            raise RuntimeError(f"{type(self).__name__} does not support backend {backend!r}")
+        return fwd_backend(*args, **kwargs)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, param: bool = False) -> None:
         super().__init__()
@@ -18,12 +45,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim)) if param else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return kernels.rms_norm(x, self.weight, self.eps)
-
-
-class Linear(nn.Linear):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return rms_norm_torch(x, self.weight, self.eps)
 
 
 class RotaryEmbedding(nn.Module):
@@ -67,6 +89,75 @@ def apply_rope_flash_layout(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
     return apply_rope(q, k, cos, sin)
 
 
+class QKNormRoPE(AcceleratedModule):
+    backend_attr = "rope_backend"
+
+    def fwd_torch(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config.qk_norm:
+            q = rms_norm_torch(q, None, self.config.norm_eps)
+            k = rms_norm_torch(k, None, self.config.norm_eps)
+        return apply_rope_flash_layout(q, k, cos, sin)
+
+    def fwd_triton(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.config.qk_norm:
+            raise RuntimeError("rope_backend=triton requires qk_norm=True")
+        return kernels.qk_norm_rope_triton(
+            q,
+            k,
+            cos.transpose(1, 2),
+            sin.transpose(1, 2),
+            self.config.norm_eps,
+        )
+
+
+class LinearCrossEntropyLoss(AcceleratedModule):
+    backend_attr = "loss_backend"
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        self.chunk_size = config.loss_chunk_size
+
+    def fwd_torch(
+        self,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.chunk_size <= 0:
+            raise RuntimeError(f"loss_chunk_size must be positive, got {self.chunk_size}")
+        hidden_flat = hidden.reshape(-1, hidden.size(-1))
+        targets_flat = targets.reshape(-1)
+        n_tokens = targets_flat.numel()
+        loss_sum = hidden_flat.new_zeros((), dtype=torch.float32)
+        for start in range(0, n_tokens, self.chunk_size):
+            end = min(start + self.chunk_size, n_tokens)
+            logits = F.linear(hidden_flat[start:end], weight, bias)
+            loss_sum = loss_sum + F.cross_entropy(logits.float(), targets_flat[start:end], reduction="sum")
+        return loss_sum / n_tokens
+
+    def fwd_triton(
+        self,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        return kernels.fused_linear_cross_entropy_with_weight(hidden, weight, bias, targets, backend="triton")
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
@@ -78,10 +169,9 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         self.q_dim = config.n_head * config.head_dim
         self.kv_dim = config.n_kv_head * config.head_dim
-        self.qkv_proj = Linear(config.n_embd, self.q_dim + 2 * self.kv_dim, bias=False)
-        self.o_proj = Linear(config.n_head * config.head_dim, config.n_embd, bias=False)
-        self.q_norm = RMSNorm(config.head_dim, config.norm_eps) if config.qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(config.head_dim, config.norm_eps) if config.qk_norm else nn.Identity()
+        self.qkv_proj = nn.Linear(config.n_embd, self.q_dim + 2 * self.kv_dim, bias=False)
+        self.o_proj = nn.Linear(config.n_head * config.head_dim, config.n_embd, bias=False)
+        self.qk_norm_rope = QKNormRoPE(config)
         self.rope = RotaryEmbedding(config.head_dim, config.rope_theta, config.rope_fraction)
         self._mask_cache: torch.Tensor | None = None
         self._mask_cache_seq_len = 0
@@ -111,21 +201,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(bsz, seq_len, self.n_kv_head, self.head_dim)
         v = v.view(bsz, seq_len, self.n_kv_head, self.head_dim)
         cos, sin = self.rope(seq_len, x.device, q.dtype)
-        if self.config.rope_backend == "triton":
-            if not self.config.qk_norm:
-                raise RuntimeError("rope_backend=triton requires qk_norm=True")
-            q, k = kernels.qk_norm_rope(
-                q,
-                k,
-                cos.transpose(1, 2),
-                sin.transpose(1, 2),
-                self.config.norm_eps,
-                backend=self.config.rope_backend,
-            )
-        else:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-            q, k = apply_rope_flash_layout(q, k, cos, sin)
+        q, k = self.qk_norm_rope(q, k, cos, sin)
         attention_backend = "torch" if x.device.type == "cpu" else self.config.attention_backend
         attn_mask = None
         if attention_backend == "torch":
@@ -156,12 +232,12 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.gate_up_proj = Linear(config.n_embd, 2 * config.mlp_hidden, bias=False)
-        self.down_proj = Linear(config.mlp_hidden, config.n_embd, bias=False)
+        self.gate_up_proj = nn.Linear(config.n_embd, 2 * config.mlp_hidden, bias=False)
+        self.down_proj = nn.Linear(config.mlp_hidden, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(kernels.swiglu(gate, up))
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Block(nn.Module):
@@ -185,9 +261,10 @@ class LanguageModel(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)])
         self.norm_f = RMSNorm(config.n_embd, config.norm_eps)
-        self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
+        self.loss = LinearCrossEntropyLoss(config)
         self.apply(self._init_weights)
         for name, param in self.named_parameters():
             if name.endswith("o_proj.weight") or name.endswith("down_proj.weight"):
@@ -206,13 +283,7 @@ class LanguageModel(nn.Module):
         x = self.norm_f(x)
         loss = None
         if targets is not None:
-            loss = kernels.chunked_linear_cross_entropy(
-                x,
-                self.lm_head,
-                targets,
-                self.config.loss_chunk_size,
-                backend=self.config.loss_backend,
-            )
+            loss = self.loss(x, self.lm_head.weight, self.lm_head.bias, targets)
             return None, loss
         logits = self.lm_head(x)
         return logits, loss

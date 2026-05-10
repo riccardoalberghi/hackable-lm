@@ -103,7 +103,6 @@ def collect_environment(cwd: str | Path = ".") -> dict[str, Any]:
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
         "torch": torch_version,
-        "liger_kernel": _version("liger_kernel"),
         "cuda": cuda,
         "gpu": gpu,
         "env": {k: os.environ.get(k) for k in env_keys if k in os.environ},

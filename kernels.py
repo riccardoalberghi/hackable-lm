@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
-import torch._dynamo
 import torch.nn.functional as F
 
 try:
@@ -29,7 +28,6 @@ class KernelInfo:
     torch_compile_capture_scalar_outputs: bool
     precision: str
     flash_attn_available: bool
-    liger_available: bool
     triton_available: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,23 +35,10 @@ class KernelInfo:
 
 
 _FLASH_ATTN = None
-_LIGER_FUSED_LINEAR_CE = None
-
-
-def liger_available() -> bool:
-    return importlib.util.find_spec("liger_kernel") is not None
 
 
 def triton_available() -> bool:
     return triton is not None
-
-
-def _require_liger(backend: str) -> None:
-    if not liger_available():
-        raise RuntimeError(
-            f"{backend} requires liger-kernel. Add it with `uv sync --locked` "
-            "in the CUDA environment."
-        )
 
 
 def _require_triton(backend: str) -> None:
@@ -62,15 +47,6 @@ def _require_triton(backend: str) -> None:
             f"{backend} requires Triton. Add it with `uv sync --locked` "
             "in the CUDA environment."
         )
-
-
-def _liger_fused_linear_ce():
-    global _LIGER_FUSED_LINEAR_CE
-    if _LIGER_FUSED_LINEAR_CE is None:
-        from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-
-        _LIGER_FUSED_LINEAR_CE = LigerFusedLinearCrossEntropyLoss(reduction="mean")
-    return _LIGER_FUSED_LINEAR_CE
 
 
 def _import_flash_attn():
@@ -124,13 +100,12 @@ def resolve_kernel_backends(
     if requested != "torch":
         raise ValueError(f"unknown kernel backend {requested!r}")
     loss_backend = loss_backend.lower()
-    if loss_backend not in {"torch", "liger"}:
+    if loss_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
     rope_backend = rope_backend.lower()
     if rope_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown RoPE backend {rope_backend!r}")
     flash_attn = _import_flash_attn()
-    has_liger = liger_available()
     has_triton = triton_available()
     if not flash_attn and not allow_torch_backend:
         raise RuntimeError(
@@ -141,9 +116,9 @@ def resolve_kernel_backends(
         raise RuntimeError(
             f"unsupported precision mode {precision!r}; the training fast path uses bf16"
         )
-    if loss_backend == "liger" and not has_liger and not allow_torch_backend:
+    if loss_backend == "triton" and not has_triton and not allow_torch_backend:
         raise RuntimeError(
-            "A Liger backend was requested but liger-kernel is not importable. "
+            "loss_backend=triton requires Triton. "
             "Run `uv sync --locked` in the CUDA environment."
         )
     if rope_backend == "triton" and not has_triton and not allow_torch_backend:
@@ -156,14 +131,13 @@ def resolve_kernel_backends(
         actual_attention_backend="flash_attn_2" if flash_attn else "torch_sdpa",
         actual_norm_backend="torch",
         actual_mlp_backend="torch",
-        actual_loss_backend="liger_fused_linear_ce" if loss_backend == "liger" and has_liger else "torch",
+        actual_loss_backend="triton_fused_linear_ce" if loss_backend == "triton" and has_triton else "torch",
         actual_rope_backend="triton" if rope_backend == "triton" and has_triton else "torch",
         torch_compile=compile_model,
         torch_compile_mode=compile_mode,
         torch_compile_capture_scalar_outputs=compile_capture_scalar_outputs,
         precision=precision,
         flash_attn_available=bool(flash_attn),
-        liger_available=has_liger,
         triton_available=has_triton,
     )
 
@@ -173,18 +147,76 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     return y if weight is None else y * weight
 
 
-def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    return F.silu(gate) * up
-
-
 if triton is not None:
+    _LINEAR_CE_MAX_BLOCK_SIZE = 32768
+    _LINEAR_CE_MIN_CHUNK_SIZE = 2048
+    _LINEAR_CE_CONFIGS = [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in (2, 4, 8, 16, 32)
+        for num_stages in (3, 4, 5)
+    ]
+
+    # Autotune replays the kernel; this kernel overwrites logits with gradients.
+    @triton.autotune(
+        configs=_LINEAR_CE_CONFIGS,
+        key=["N_ROWS", "n_cols", "BLOCK_SIZE"],
+        restore_value=["logits"],
+    )
+    @triton.jit
+    def _linear_ce_kernel(
+        logits,
+        logits_stride: tl.constexpr,
+        targets,
+        loss_out,
+        n_cols: tl.constexpr,
+        n_rows: tl.constexpr,
+        N_ROWS: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        target = tl.load(targets + row)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        row_ptr = logits + row * logits_stride
+        values = tl.load(row_ptr + offsets, mask=mask, other=float("-inf"))
+        m = tl.max(values, axis=0)
+        exp_values = tl.exp(values - m)
+        d = tl.sum(exp_values, axis=0)
+        lse = m + tl.log(d)
+        target_logit = tl.load(row_ptr + target).to(tl.float32)
+        tl.store(loss_out + row, (lse - target_logit) / n_rows)
+
+        inv_d = 1.0 / d
+        grad = exp_values * inv_d
+        grad = tl.where(offsets == target, grad - 1.0, grad) / n_rows
+        tl.store(row_ptr + offsets, grad, mask=mask)
+
+    @torch.library.triton_op("simple_lm::linear_ce", mutates_args={"logits"})
+    def _triton_linear_ce(logits: torch.Tensor, targets: torch.Tensor, n_tokens: int) -> torch.Tensor:
+        loss_1d = torch.empty(logits.shape[0], dtype=torch.float32, device=logits.device)
+        vocab_size = logits.shape[1]
+        block_size = min(_LINEAR_CE_MAX_BLOCK_SIZE, triton.next_power_of_2(vocab_size))
+        grid = (logits.shape[0],)
+        torch.library.wrap_triton(_linear_ce_kernel)[grid](
+            logits,
+            logits.stride(0),
+            targets,
+            loss_1d,
+            vocab_size,
+            n_tokens,
+            N_ROWS=logits.shape[0],
+            BLOCK_SIZE=block_size,
+        )
+        return loss_1d
+
+
     _QK_NORM_ROPE_CONFIGS = [
-        triton.Config({"BLOCK_M": 1}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 2}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 4}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 8}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 4}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
+        for block_m in (1, 2, 4, 8, 16)
+        for num_warps in (1, 2, 4, 8)
+        for num_stages in (3, 4)
+        if not (block_m == 1 and num_warps == 8)
+        if not (block_m >= 8 and num_warps == 1)
     ]
 
     @triton.autotune(
@@ -406,6 +438,9 @@ if triton is not None:
         )
         return grad_q_out, grad_k_out
 else:
+    _LINEAR_CE_MAX_BLOCK_SIZE = 32768
+    _LINEAR_CE_MIN_CHUNK_SIZE = 2048
+    _triton_linear_ce = None
     _triton_qk_norm_rope = None
     _triton_qk_norm_rope_backward_op = None
 
@@ -479,22 +514,17 @@ if triton is not None:
     torch.library.register_autograd("simple_lm::qk_norm_rope", _qk_norm_rope_backward, setup_context=_qk_norm_rope_setup)
 
 
-def qk_norm_rope(
+def qk_norm_rope_triton(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     eps: float,
-    backend: str = "torch",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if backend == "torch":
-        return _qk_norm_rope_torch(q, k, cos, sin, eps)
-    if backend == "triton":
-        if q.is_cuda:
-            _require_triton("rope_backend=triton")
-            return _triton_qk_norm_rope(q, k, cos, sin, eps)
-        return _qk_norm_rope_torch(q, k, cos, sin, eps)
-    raise RuntimeError(f"unsupported QK norm RoPE backend {backend!r}")
+    if q.is_cuda:
+        _require_triton("rope_backend=triton")
+        return _triton_qk_norm_rope(q, k, cos, sin, eps)
+    return _qk_norm_rope_torch(q, k, cos, sin, eps)
 
 
 def scaled_dot_product_attention(
@@ -526,49 +556,95 @@ def scaled_dot_product_attention(
     return flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal, window_size=flash_window)
 
 
-def cross_entropy(logits: torch.Tensor, targets: torch.Tensor, backend: str = "torch") -> torch.Tensor:
-    if backend != "torch":
-        raise RuntimeError(f"unsupported cross entropy backend {backend!r}")
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+def _scale_saved_grad(grad: torch.Tensor | None, scale: torch.Tensor) -> torch.Tensor | None:
+    if grad is None:
+        return None
+    return grad * scale.to(dtype=grad.dtype)
 
 
-@torch._dynamo.disable
-def _liger_fused_linear_cross_entropy(
+class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        targets: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        _require_triton("loss_backend=triton")
+        hidden = hidden.contiguous()
+        weight = weight.contiguous()
+        targets = targets.contiguous()
+        n_tokens, hidden_size = hidden.shape
+        vocab_size = weight.shape[0]
+        inc_factor = triton.cdiv(vocab_size, hidden_size)
+        chunk_size = triton.next_power_of_2(triton.cdiv(n_tokens, inc_factor))
+        chunk_size = min(n_tokens, max(chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
+        num_chunks = triton.cdiv(n_tokens, chunk_size)
+
+        grad_hidden = torch.empty_like(hidden)
+        grad_weight = torch.zeros_like(weight) if weight.requires_grad else None
+        grad_bias = torch.zeros_like(bias) if bias is not None and bias.requires_grad else None
+        loss_1d = torch.empty(n_tokens, dtype=torch.float32, device=hidden.device)
+
+        for chunk_id in range(num_chunks):
+            start = chunk_id * chunk_size
+            end = min(start + chunk_size, n_tokens)
+            hidden_chunk = hidden[start:end]
+            logits = hidden_chunk @ weight.t()
+            if bias is not None:
+                logits = logits + bias
+            logits = logits.contiguous()
+            loss_1d[start:end] = _triton_linear_ce(logits, targets[start:end], n_tokens)
+            grad_logits = logits
+            if hidden.requires_grad:
+                grad_hidden[start:end] = grad_logits @ weight
+            if grad_weight is not None:
+                grad_weight += torch.mm(grad_logits.t(), hidden_chunk).to(grad_weight.dtype)
+            if grad_bias is not None:
+                grad_bias += grad_logits.sum(dim=0).to(grad_bias.dtype)
+
+        ctx.save_for_backward(
+            grad_hidden.detach() if hidden.requires_grad else None,
+            grad_weight.detach() if grad_weight is not None else None,
+            grad_bias.detach() if grad_bias is not None else None,
+        )
+        return loss_1d.sum()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, torch.Tensor | None]:
+        grad_hidden, grad_weight, grad_bias = ctx.saved_tensors
+        return (
+            _scale_saved_grad(grad_hidden, grad_output) if ctx.needs_input_grad[0] else None,
+            _scale_saved_grad(grad_weight, grad_output) if ctx.needs_input_grad[1] else None,
+            None,
+            _scale_saved_grad(grad_bias, grad_output) if ctx.needs_input_grad[3] else None,
+        )
+
+
+def _triton_fused_linear_cross_entropy(
     weight: torch.Tensor,
     hidden: torch.Tensor,
     targets: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    return _liger_fused_linear_ce()(weight, hidden, targets, bias=bias)
+    if not hidden.is_cuda:
+        return F.cross_entropy(F.linear(hidden, weight, bias).float(), targets)
+    return _TritonFusedLinearCrossEntropy.apply(hidden, weight, targets, bias)
 
 
-def chunked_linear_cross_entropy(
+def fused_linear_cross_entropy_with_weight(
     hidden: torch.Tensor,
-    lm_head: torch.nn.Module,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
     targets: torch.Tensor,
-    chunk_size: int,
-    backend: str = "torch",
+    backend: str,
 ) -> torch.Tensor:
-    if backend == "liger":
-        _require_liger("loss_backend=liger")
-        hidden_flat = hidden.reshape(-1, hidden.size(-1))
-        targets_flat = targets.reshape(-1).contiguous()
-        weight = lm_head.weight
-        bias = lm_head.bias
-        return _liger_fused_linear_cross_entropy(weight, hidden_flat, targets_flat, bias)
-    if backend != "torch":
-        raise RuntimeError(f"unsupported chunked linear cross entropy backend {backend!r}")
-    if chunk_size <= 0:
-        raise RuntimeError(f"loss_chunk_size must be positive, got {chunk_size}")
     hidden_flat = hidden.reshape(-1, hidden.size(-1))
-    targets_flat = targets.reshape(-1)
-    n_tokens = targets_flat.numel()
-    loss_sum = hidden_flat.new_zeros((), dtype=torch.float32)
-    for start in range(0, n_tokens, chunk_size):
-        end = min(start + chunk_size, n_tokens)
-        logits = lm_head(hidden_flat[start:end])
-        loss_sum = loss_sum + F.cross_entropy(logits.float(), targets_flat[start:end], reduction="sum")
-    return loss_sum / n_tokens
+    targets_flat = targets.reshape(-1).contiguous()
+    if backend == "triton":
+        return _triton_fused_linear_cross_entropy(weight, hidden_flat, targets_flat, bias)
+    raise RuntimeError(f"unsupported fused linear cross entropy backend {backend!r}")
 
 
 def apply_precision_policy(model: torch.nn.Module, precision: str, allow_torch_backend: bool = False) -> torch.nn.Module:

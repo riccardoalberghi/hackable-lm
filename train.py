@@ -383,7 +383,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-interval", type=int, default=500)
     parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
-    parser.add_argument("--loss-backend", choices=["torch", "liger"])
+    parser.add_argument("--loss-backend", choices=["torch", "triton"])
     parser.add_argument("--rope-backend", choices=["torch", "triton"])
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-mode", default=DEFAULTS["compile_mode"], choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
