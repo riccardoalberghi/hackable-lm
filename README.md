@@ -38,6 +38,15 @@ uv run python eval.py \
   --limit-per-task 128
 ```
 
+For the FineWeb depth presets that download data, prepare it, train, and run
+the local eval pass, use:
+
+```bash
+scripts/run_fineweb.sh 6
+scripts/run_fineweb.sh 12
+scripts/run_fineweb.sh 18
+```
+
 Dependencies are managed by `uv` through `pyproject.toml` and `uv.lock`. The
 lockfile targets the CUDA Linux x86_64 training path. Tokenization uses the
 local Rust backend in `rustbpe/`, so `cargo` must be available when the native
