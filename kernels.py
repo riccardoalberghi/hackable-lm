@@ -19,7 +19,6 @@ except ModuleNotFoundError:
 class KernelInfo:
     requested_backend: str
     actual_attention_backend: str
-    actual_norm_backend: str
     actual_mlp_backend: str
     actual_loss_backend: str
     actual_rope_backend: str
@@ -129,7 +128,6 @@ def resolve_kernel_backends(
     return KernelInfo(
         requested_backend=requested,
         actual_attention_backend="flash_attn_2" if flash_attn else "torch_sdpa",
-        actual_norm_backend="torch",
         actual_mlp_backend="torch",
         actual_loss_backend="triton_fused_linear_ce" if loss_backend == "triton" and has_triton else "torch",
         actual_rope_backend="triton" if rope_backend == "triton" and has_triton else "torch",

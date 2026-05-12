@@ -123,7 +123,6 @@ def test_kernel_resolution_and_hashing() -> None:
         allow_torch_backend=True,
     )
     assert info.actual_attention_backend in {"flash_attn_2", "torch_sdpa"}
-    assert info.actual_norm_backend == "torch"
     assert info.actual_mlp_backend == "torch"
     assert info.actual_loss_backend in {"triton_fused_linear_ce", "torch"}
     assert info.actual_rope_backend == "torch"
