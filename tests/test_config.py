@@ -28,6 +28,7 @@ def test_config_derivation() -> None:
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
     assert default_cfg.model.loss_backend == "triton"
+    assert default_cfg.model.loss_chunk_size == DEFAULTS["loss_chunk_size"]
     assert default_cfg.model.rope_backend == "triton"
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
     assert pattern == [512, 512, 512, None, 512, 512, 512, None]
@@ -54,6 +55,10 @@ def test_config_derivation() -> None:
     assert not hasattr(config_from_dict(stale_mlp_style).model, "mlp_activation")
     triton_rope = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="triton")
     assert triton_rope.model.rope_backend == "triton"
+    custom_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=8192)
+    assert custom_loss_chunk.model.loss_chunk_size == 8192
+    heuristic_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=0)
+    assert heuristic_loss_chunk.model.loss_chunk_size == 0
 
 
 def test_config_shape_and_budget_controls() -> None:
@@ -73,6 +78,12 @@ def test_config_shape_and_budget_controls() -> None:
         assert "choose only one budget override" in str(exc)
     else:
         raise AssertionError("conflicting budget overrides should fail")
+    try:
+        resolve_config(depth=6, vocab_size=32768, loss_chunk_size=-1)
+    except ValueError as exc:
+        assert "loss_chunk_size must be nonnegative" in str(exc)
+    else:
+        raise AssertionError("negative loss_chunk_size should fail")
 
 
 def test_auto_device_batch_size_l40_shapes() -> None:

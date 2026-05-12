@@ -43,8 +43,9 @@ if ! command -v uv >/dev/null 2>&1; then
   python -m pip install --upgrade pip uv
 fi
 
-uv venv
-uv sync --locked
+# Ensure rustup-installed toolchains are visible to make setup/uv builds.
+export PATH="$HOME/.cargo/bin:$PATH"
+make setup
 
 uv run python - <<'PY'
 from tokenizer import TOKENIZER_BACKEND

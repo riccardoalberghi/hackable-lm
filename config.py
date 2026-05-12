@@ -170,7 +170,7 @@ class ModelConfig:
     attention_full_every: int | None = DEFAULTS["attention_full_every"]
     attention_backend: str = "flash_attn_2"
     loss_backend: str = DEFAULTS["loss_backend"]
-    loss_chunk_size: int = DEFAULTS["loss_chunk_size"]
+    loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"]
     rope_backend: str = DEFAULTS["rope_backend"]
 
 
@@ -253,6 +253,7 @@ def resolve_config(
     compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"],
     kernel_backend: str = "torch",
     loss_backend: str = DEFAULTS["loss_backend"],
+    loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"],
     rope_backend: str = DEFAULTS["rope_backend"],
     comparison_mode: str = "same_depth",
 ) -> ResolvedConfig:
@@ -266,6 +267,8 @@ def resolve_config(
         raise ValueError(f"unknown kernel backend {kernel_backend!r}")
     if loss_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
+    if loss_chunk_size is not None and loss_chunk_size < 0:
+        raise ValueError(f"loss_chunk_size must be nonnegative, got {loss_chunk_size}")
     if rope_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown RoPE backend {rope_backend!r}")
     budget_overrides = [num_iterations, target_tokens, target_bytes, target_flops, target_time_seconds]
@@ -350,7 +353,7 @@ def resolve_config(
         attention_backend="flash_attn_2",
         loss_backend=loss_backend,
         rope_backend=rope_backend,
-        loss_chunk_size=DEFAULTS["loss_chunk_size"],
+        loss_chunk_size=loss_chunk_size,
     )
 
     return ResolvedConfig(

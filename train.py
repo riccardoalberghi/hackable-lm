@@ -403,6 +403,9 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
     if args.loss_backend is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.loss_backend = model_cfg.get("loss_backend")
+    if args.loss_chunk_size is None:
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        args.loss_chunk_size = model_cfg.get("loss_chunk_size")
     if args.rope_backend is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.rope_backend = model_cfg.get("rope_backend")
@@ -483,6 +486,7 @@ def main() -> None:
     parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
     parser.add_argument("--loss-backend", choices=["torch", "triton"])
+    parser.add_argument("--loss-chunk-size", type=int, help="token rows per linear CE chunk; use 0 for the built-in heuristic")
     parser.add_argument("--rope-backend", choices=["torch", "triton"])
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-mode", default=DEFAULTS["compile_mode"], choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
@@ -512,6 +516,9 @@ def main() -> None:
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
     args.target_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio is not None else DEFAULTS["target_param_data_ratio"]
     args.loss_backend = args.loss_backend if args.loss_backend is not None else DEFAULTS["loss_backend"]
+    args.loss_chunk_size = args.loss_chunk_size if args.loss_chunk_size is not None else DEFAULTS["loss_chunk_size"]
+    if args.loss_chunk_size < 0:
+        parser.error("--loss-chunk-size must be >= 0")
     args.rope_backend = args.rope_backend if args.rope_backend is not None else DEFAULTS["rope_backend"]
     if args.depth is None and args.target_params is None:
         parser.error("--depth is required unless --target-params is provided or --match-run fills it")
@@ -548,6 +555,7 @@ def main() -> None:
         compile_capture_scalar_outputs=not args.no_compile_capture_scalar_outputs,
         kernel_backend="torch",
         loss_backend=args.loss_backend,
+        loss_chunk_size=args.loss_chunk_size,
         rope_backend=args.rope_backend,
         comparison_mode=args.comparison_mode,
     )

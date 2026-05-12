@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.machinery
 import importlib.util
 import shutil
@@ -75,6 +76,10 @@ def _build_extension() -> Path:
 
 
 def load_native() -> ModuleType:
+    try:
+        return importlib.import_module(_MODULE_NAME)
+    except ImportError:
+        pass
     for candidate in _extension_candidates():
         if candidate.exists() and not _needs_rebuild(candidate):
             try:

@@ -562,6 +562,12 @@ def _scale_saved_grad(grad: torch.Tensor | None, scale: torch.Tensor) -> torch.T
     return grad * scale.to(dtype=grad.dtype)
 
 
+def _linear_ce_heuristic_chunk_size(n_tokens: int, hidden_size: int, vocab_size: int) -> int:
+    inc_factor = triton.cdiv(vocab_size, hidden_size)
+    chunk_size = triton.next_power_of_2(triton.cdiv(n_tokens, inc_factor))
+    return min(n_tokens, max(chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
+
+
 class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -570,16 +576,20 @@ class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
         weight: torch.Tensor,
         targets: torch.Tensor,
         bias: torch.Tensor | None,
+        requested_chunk_size: int | None,
     ) -> torch.Tensor:
         _require_triton("loss_backend=triton")
+        if requested_chunk_size is not None and requested_chunk_size < 0:
+            raise RuntimeError(f"loss_chunk_size must be nonnegative, got {requested_chunk_size}")
         hidden = hidden.contiguous()
         weight = weight.contiguous()
         targets = targets.contiguous()
         n_tokens, hidden_size = hidden.shape
         vocab_size = weight.shape[0]
-        inc_factor = triton.cdiv(vocab_size, hidden_size)
-        chunk_size = triton.next_power_of_2(triton.cdiv(n_tokens, inc_factor))
-        chunk_size = min(n_tokens, max(chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
+        if requested_chunk_size:
+            chunk_size = min(n_tokens, max(requested_chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
+        else:
+            chunk_size = _linear_ce_heuristic_chunk_size(n_tokens, hidden_size, vocab_size)
         num_chunks = triton.cdiv(n_tokens, chunk_size)
 
         grad_hidden = torch.empty_like(hidden)
@@ -612,13 +622,14 @@ class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
         return loss_1d.sum()
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, torch.Tensor | None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, torch.Tensor | None, None]:
         grad_hidden, grad_weight, grad_bias = ctx.saved_tensors
         return (
             _scale_saved_grad(grad_hidden, grad_output) if ctx.needs_input_grad[0] else None,
             _scale_saved_grad(grad_weight, grad_output) if ctx.needs_input_grad[1] else None,
             None,
             _scale_saved_grad(grad_bias, grad_output) if ctx.needs_input_grad[3] else None,
+            None,
         )
 
 
@@ -627,10 +638,11 @@ def _triton_fused_linear_cross_entropy(
     hidden: torch.Tensor,
     targets: torch.Tensor,
     bias: torch.Tensor | None,
+    chunk_size: int | None,
 ) -> torch.Tensor:
     if not hidden.is_cuda:
         return F.cross_entropy(F.linear(hidden, weight, bias).float(), targets)
-    return _TritonFusedLinearCrossEntropy.apply(hidden, weight, targets, bias)
+    return _TritonFusedLinearCrossEntropy.apply(hidden, weight, targets, bias, chunk_size)
 
 
 def fused_linear_cross_entropy_with_weight(
@@ -639,11 +651,12 @@ def fused_linear_cross_entropy_with_weight(
     bias: torch.Tensor | None,
     targets: torch.Tensor,
     backend: str,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
     hidden_flat = hidden.reshape(-1, hidden.size(-1))
     targets_flat = targets.reshape(-1).contiguous()
     if backend == "triton":
-        return _triton_fused_linear_cross_entropy(weight, hidden_flat, targets_flat, bias)
+        return _triton_fused_linear_cross_entropy(weight, hidden_flat, targets_flat, bias, chunk_size)
     raise RuntimeError(f"unsupported fused linear cross entropy backend {backend!r}")
 
 

@@ -136,14 +136,15 @@ class LinearCrossEntropyLoss(AcceleratedModule):
         bias: torch.Tensor | None,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        if self.chunk_size <= 0:
-            raise RuntimeError(f"loss_chunk_size must be positive, got {self.chunk_size}")
         hidden_flat = hidden.reshape(-1, hidden.size(-1))
         targets_flat = targets.reshape(-1)
         n_tokens = targets_flat.numel()
+        chunk_size = self.chunk_size if self.chunk_size else n_tokens
+        if chunk_size < 0:
+            raise RuntimeError(f"loss_chunk_size must be nonnegative, got {self.chunk_size}")
         loss_sum = hidden_flat.new_zeros((), dtype=torch.float32)
-        for start in range(0, n_tokens, self.chunk_size):
-            end = min(start + self.chunk_size, n_tokens)
+        for start in range(0, n_tokens, chunk_size):
+            end = min(start + chunk_size, n_tokens)
             logits = F.linear(hidden_flat[start:end], weight, bias)
             loss_sum = loss_sum + F.cross_entropy(logits.float(), targets_flat[start:end], reduction="sum")
         return loss_sum / n_tokens
@@ -155,7 +156,14 @@ class LinearCrossEntropyLoss(AcceleratedModule):
         bias: torch.Tensor | None,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        return kernels.fused_linear_cross_entropy_with_weight(hidden, weight, bias, targets, backend="triton")
+        return kernels.fused_linear_cross_entropy_with_weight(
+            hidden,
+            weight,
+            bias,
+            targets,
+            backend="triton",
+            chunk_size=self.chunk_size,
+        )
 
 
 class CausalSelfAttention(nn.Module):
