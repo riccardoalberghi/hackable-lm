@@ -400,6 +400,9 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
         args.global_batch_tokens = cfg.get("global_batch_tokens")
     if args.device_batch_size is None:
         args.device_batch_size = cfg.get("device_batch_size")
+    if args.mlp_backend is None:
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        args.mlp_backend = model_cfg.get("mlp_backend")
     if args.loss_backend is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.loss_backend = model_cfg.get("loss_backend")
@@ -485,6 +488,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-interval", type=int, default=500)
     parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
+    parser.add_argument("--mlp-backend", choices=["torch", "triton"])
     parser.add_argument("--loss-backend", choices=["torch", "triton"])
     parser.add_argument("--loss-chunk-size", type=int, help="token rows per linear CE chunk; use 0 for the built-in heuristic")
     parser.add_argument("--rope-backend", choices=["torch", "triton"])
@@ -515,6 +519,7 @@ def main() -> None:
     args.attention_window = args.attention_window if args.attention_window is not None else DEFAULTS["attention_window"]
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
     args.target_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio is not None else DEFAULTS["target_param_data_ratio"]
+    args.mlp_backend = args.mlp_backend if args.mlp_backend is not None else DEFAULTS["mlp_backend"]
     args.loss_backend = args.loss_backend if args.loss_backend is not None else DEFAULTS["loss_backend"]
     args.loss_chunk_size = args.loss_chunk_size if args.loss_chunk_size is not None else DEFAULTS["loss_chunk_size"]
     if args.loss_chunk_size < 0:
@@ -554,6 +559,7 @@ def main() -> None:
         compile_mode=args.compile_mode,
         compile_capture_scalar_outputs=not args.no_compile_capture_scalar_outputs,
         kernel_backend="torch",
+        mlp_backend=args.mlp_backend,
         loss_backend=args.loss_backend,
         loss_chunk_size=args.loss_chunk_size,
         rope_backend=args.rope_backend,
@@ -575,13 +581,14 @@ def main() -> None:
         config.gradient_accumulation_steps = total_grad_accum // world_size
         config.world_size = world_size
     kernel_info = resolve_kernel_backends(
-        config.kernel_backend,
-        config.precision,
-        config.compile,
-        config.compile_mode,
-        config.compile_capture_scalar_outputs,
-        config.model.loss_backend,
-        config.model.rope_backend,
+        requested=config.kernel_backend,
+        precision=config.precision,
+        compile_model=config.compile,
+        compile_mode=config.compile_mode,
+        compile_capture_scalar_outputs=config.compile_capture_scalar_outputs,
+        loss_backend=config.model.loss_backend,
+        rope_backend=config.model.rope_backend,
+        mlp_backend=config.model.mlp_backend,
     ).to_dict()
     loader = MemmapDataLoader(args.data, config.sequence_len, seed=args.seed + int(ddp["rank"]))
     raw_model = LanguageModel(config.model).to(device)

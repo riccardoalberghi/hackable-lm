@@ -94,10 +94,15 @@ def resolve_kernel_backends(
     loss_backend: str = "torch",
     rope_backend: str = "torch",
     allow_torch_backend: bool = False,
+    *,
+    mlp_backend: str = "torch",
 ) -> KernelInfo:
     requested = requested.lower()
     if requested != "torch":
         raise ValueError(f"unknown kernel backend {requested!r}")
+    mlp_backend = mlp_backend.lower()
+    if mlp_backend not in {"torch", "triton"}:
+        raise ValueError(f"unknown MLP backend {mlp_backend!r}")
     loss_backend = loss_backend.lower()
     if loss_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
@@ -115,6 +120,11 @@ def resolve_kernel_backends(
         raise RuntimeError(
             f"unsupported precision mode {precision!r}; the training fast path uses bf16"
         )
+    if mlp_backend == "triton" and not has_triton and not allow_torch_backend:
+        raise RuntimeError(
+            "mlp_backend=triton requires Triton. "
+            "Run `uv sync --locked` in the CUDA environment."
+        )
     if loss_backend == "triton" and not has_triton and not allow_torch_backend:
         raise RuntimeError(
             "loss_backend=triton requires Triton. "
@@ -128,7 +138,7 @@ def resolve_kernel_backends(
     return KernelInfo(
         requested_backend=requested,
         actual_attention_backend="flash_attn_2" if flash_attn else "torch_sdpa",
-        actual_mlp_backend="torch",
+        actual_mlp_backend="triton_swiglu" if mlp_backend == "triton" and has_triton else "torch",
         actual_loss_backend="triton_fused_linear_ce" if loss_backend == "triton" and has_triton else "torch",
         actual_rope_backend="triton" if rope_backend == "triton" and has_triton else "torch",
         torch_compile=compile_model,
@@ -145,9 +155,21 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     return y if weight is None else y * weight
 
 
+def _swiglu_torch(gate_up: torch.Tensor) -> torch.Tensor:
+    gate, up = gate_up.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
 if triton is not None:
     _LINEAR_CE_MAX_BLOCK_SIZE = 32768
     _LINEAR_CE_MIN_CHUNK_SIZE = 2048
+    _SWIGLU_MAX_BLOCK_SIZE = 8192
+    _SWIGLU_CONFIGS = [
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
+        for block_m in (1, 2, 4)
+        for num_warps in (4, 8, 16)
+        for num_stages in (3, 4)
+    ]
     _LINEAR_CE_CONFIGS = [
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in (2, 4, 8, 16, 32)
@@ -206,6 +228,89 @@ if triton is not None:
             BLOCK_SIZE=block_size,
         )
         return loss_1d
+
+    @triton.autotune(
+        configs=_SWIGLU_CONFIGS,
+        key=["N_ROWS", "N_COLS", "BLOCK_N"],
+    )
+    @triton.jit
+    def _swiglu_kernel(
+        gate_up,
+        out,
+        N_ROWS: tl.constexpr,
+        N_COLS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_N)
+        mask = (rows[:, None] < N_ROWS) & (cols[None, :] < N_COLS)
+        row_offsets = rows[:, None] * (2 * N_COLS)
+        gate = tl.load(gate_up + row_offsets + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gate_up + row_offsets + N_COLS + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+        tl.store(out + rows[:, None] * N_COLS + cols[None, :], gate * sigmoid * up, mask=mask)
+
+    @triton.autotune(
+        configs=_SWIGLU_CONFIGS,
+        key=["N_ROWS", "N_COLS", "BLOCK_N"],
+    )
+    @triton.jit
+    def _swiglu_backward_kernel(
+        gate_up,
+        grad_out,
+        grad_gate_up,
+        N_ROWS: tl.constexpr,
+        N_COLS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_N)
+        mask = (rows[:, None] < N_ROWS) & (cols[None, :] < N_COLS)
+        gate_up_offsets = rows[:, None] * (2 * N_COLS)
+        out_offsets = rows[:, None] * N_COLS + cols[None, :]
+        gate = tl.load(gate_up + gate_up_offsets + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gate_up + gate_up_offsets + N_COLS + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        grad = tl.load(grad_out + out_offsets, mask=mask, other=0.0).to(tl.float32)
+        sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+        silu = gate * sigmoid
+        dsilu = sigmoid * (1.0 + gate * (1.0 - sigmoid))
+        tl.store(grad_gate_up + gate_up_offsets + cols[None, :], grad * up * dsilu, mask=mask)
+        tl.store(grad_gate_up + gate_up_offsets + N_COLS + cols[None, :], grad * silu, mask=mask)
+
+    @torch.library.triton_op("simple_lm::swiglu", mutates_args={})
+    def _triton_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
+        hidden = gate_up.shape[-1] // 2
+        rows = gate_up.numel() // (2 * hidden)
+        out = torch.empty((*gate_up.shape[:-1], hidden), dtype=gate_up.dtype, device=gate_up.device)
+        block_n = min(_SWIGLU_MAX_BLOCK_SIZE, triton.next_power_of_2(hidden))
+        grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)
+        torch.library.wrap_triton(_swiglu_kernel)[grid](
+            gate_up,
+            out,
+            rows,
+            hidden,
+            BLOCK_N=block_n,
+        )
+        return out
+
+    @torch.library.triton_op("simple_lm::swiglu_backward", mutates_args={})
+    def _triton_swiglu_backward_op(gate_up: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
+        hidden = grad_out.shape[-1]
+        rows = grad_out.numel() // hidden
+        grad_gate_up = torch.empty_like(gate_up, memory_format=torch.contiguous_format)
+        block_n = min(_SWIGLU_MAX_BLOCK_SIZE, triton.next_power_of_2(hidden))
+        grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)
+        torch.library.wrap_triton(_swiglu_backward_kernel)[grid](
+            gate_up,
+            grad_out,
+            grad_gate_up,
+            rows,
+            hidden,
+            BLOCK_N=block_n,
+        )
+        return grad_gate_up
 
 
     _QK_NORM_ROPE_CONFIGS = [
@@ -438,6 +543,9 @@ if triton is not None:
 else:
     _LINEAR_CE_MAX_BLOCK_SIZE = 32768
     _LINEAR_CE_MIN_CHUNK_SIZE = 2048
+    _SWIGLU_MAX_BLOCK_SIZE = 8192
+    _triton_swiglu = None
+    _triton_swiglu_backward_op = None
     _triton_linear_ce = None
     _triton_qk_norm_rope = None
     _triton_qk_norm_rope_backward_op = None
@@ -471,6 +579,24 @@ def _qk_norm_rope_setup(ctx, inputs, output) -> None:
     q, k, cos, sin, eps = inputs
     ctx.save_for_backward(q, k, cos, sin)
     ctx.eps = eps
+
+
+def _swiglu_setup(ctx, inputs, output) -> None:
+    (gate_up,) = inputs
+    ctx.save_for_backward(gate_up)
+
+
+def _swiglu_backward(ctx, grad_out: torch.Tensor | None) -> tuple[torch.Tensor | None]:
+    if grad_out is None:
+        return (None,)
+    (gate_up,) = ctx.saved_tensors
+    if gate_up.is_cuda:
+        return (_triton_swiglu_backward_op(gate_up, grad_out.contiguous()),)
+    gate, up = gate_up.chunk(2, dim=-1)
+    sigmoid = torch.sigmoid(gate)
+    silu = gate * sigmoid
+    dsilu = sigmoid * (1.0 + gate * (1.0 - sigmoid))
+    return (torch.cat((grad_out * up * dsilu, grad_out * silu), dim=-1),)
 
 
 def _norm_backward_no_weight(x: torch.Tensor, grad: torch.Tensor, eps: float) -> torch.Tensor:
@@ -509,7 +635,20 @@ def _qk_norm_rope_backward(
 
 
 if triton is not None:
+    torch.library.register_autograd("simple_lm::swiglu", _swiglu_backward, setup_context=_swiglu_setup)
     torch.library.register_autograd("simple_lm::qk_norm_rope", _qk_norm_rope_backward, setup_context=_qk_norm_rope_setup)
+
+
+def swiglu_triton(gate_up: torch.Tensor) -> torch.Tensor:
+    if gate_up.shape[-1] % 2:
+        raise RuntimeError(f"SwiGLU input last dimension must be even, got {gate_up.shape[-1]}")
+    hidden = gate_up.shape[-1] // 2
+    if hidden > _SWIGLU_MAX_BLOCK_SIZE:
+        raise RuntimeError(f"SwiGLU hidden dimension {hidden} exceeds Triton kernel limit {_SWIGLU_MAX_BLOCK_SIZE}")
+    if gate_up.is_cuda:
+        _require_triton("mlp_backend=triton")
+        return _triton_swiglu(gate_up.contiguous())
+    return _swiglu_torch(gate_up)
 
 
 def qk_norm_rope_triton(

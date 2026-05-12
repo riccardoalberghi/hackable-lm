@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from conftest import requires_torch, torch
+import pytest
+
+from conftest import requires_cuda, requires_torch, torch
 
 
 @requires_torch
@@ -31,6 +33,65 @@ def test_bf16_precision_policy_leaves_modules_unchanged() -> None:
     assert model[0].weight.dtype == torch.float32
     assert kernels.apply_precision_policy(model, "bf16") is model
     assert model[0].weight.dtype == torch.bfloat16
+
+
+@requires_torch
+def test_swiglu_torch_fallback_matches_baseline_and_backward() -> None:
+    import torch.nn.functional as F
+
+    import kernels
+
+    torch.manual_seed(0)
+    gate_up = torch.randn(2, 5, 64, requires_grad=True)
+    ref_gate_up = gate_up.detach().clone().requires_grad_(True)
+    grad = torch.randn(2, 5, 32)
+
+    out = kernels.swiglu_triton(gate_up)
+    gate, up = ref_gate_up.chunk(2, dim=-1)
+    ref = F.silu(gate) * up
+    out.backward(grad)
+    ref.backward(grad)
+
+    assert torch.allclose(out, ref, atol=1e-6)
+    assert torch.allclose(gate_up.grad, ref_gate_up.grad, atol=1e-6)
+
+
+@pytest.mark.cuda
+@requires_torch
+@requires_cuda
+def test_swiglu_triton_matches_baseline_and_backward() -> None:
+    import torch.nn.functional as F
+
+    import kernels
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    fp32_gate_up = torch.randn(17, 130, device=device, dtype=torch.float32, requires_grad=True)
+    ref_fp32_gate_up = fp32_gate_up.detach().clone().requires_grad_(True)
+    fp32_grad = torch.randn(17, 65, device=device)
+
+    fp32_out = kernels.swiglu_triton(fp32_gate_up)
+    fp32_gate, fp32_up = ref_fp32_gate_up.chunk(2, dim=-1)
+    fp32_ref = F.silu(fp32_gate) * fp32_up
+    fp32_out.backward(fp32_grad)
+    fp32_ref.backward(fp32_grad)
+
+    assert torch.allclose(fp32_out, fp32_ref, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(fp32_gate_up.grad, ref_fp32_gate_up.grad, atol=1e-5, rtol=1e-5)
+
+    gate_up = torch.randn(128, 4096, device=device, dtype=torch.bfloat16, requires_grad=True)
+    ref_gate_up = gate_up.detach().clone().requires_grad_(True)
+    grad = torch.randn(128, 2048, device=device, dtype=torch.bfloat16)
+
+    out = kernels.swiglu_triton(gate_up)
+    gate, up = ref_gate_up.chunk(2, dim=-1)
+    ref = F.silu(gate) * up
+    out.backward(grad)
+    ref.backward(grad)
+    torch.cuda.synchronize()
+
+    assert torch.allclose(out.float(), ref.float(), atol=8e-2, rtol=8e-2)
+    assert torch.allclose(gate_up.grad.float(), ref_gate_up.grad.float(), atol=8e-2, rtol=8e-2)
 
 
 @requires_torch
@@ -137,4 +198,12 @@ def test_kernel_resolution_and_hashing() -> None:
     )
     assert rope_info.actual_loss_backend in {"triton_fused_linear_ce", "torch"}
     assert rope_info.actual_rope_backend in {"triton", "torch"}
+    mlp_info = resolve_kernel_backends(
+        "torch",
+        "fp32_test",
+        False,
+        mlp_backend="triton",
+        allow_torch_backend=True,
+    )
+    assert mlp_info.actual_mlp_backend in {"triton_swiglu", "torch"}
     assert len(hash_directory(Path.cwd())) == 64

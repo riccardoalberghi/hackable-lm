@@ -32,6 +32,7 @@ DEFAULTS = {
     "final_lr_frac": 0.1,
     "compile_mode": "max-autotune-no-cudagraphs",
     "compile_capture_scalar_outputs": True,
+    "mlp_backend": "triton",
     "loss_backend": "triton",
     "rope_backend": "triton",
     "loss_chunk_size": 4096,
@@ -169,6 +170,7 @@ class ModelConfig:
     attention_window: int | None = DEFAULTS["attention_window"]
     attention_full_every: int | None = DEFAULTS["attention_full_every"]
     attention_backend: str = "flash_attn_2"
+    mlp_backend: str = DEFAULTS["mlp_backend"]
     loss_backend: str = DEFAULTS["loss_backend"]
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"]
     rope_backend: str = DEFAULTS["rope_backend"]
@@ -252,6 +254,7 @@ def resolve_config(
     compile_mode: str = DEFAULTS["compile_mode"],
     compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"],
     kernel_backend: str = "torch",
+    mlp_backend: str = DEFAULTS["mlp_backend"],
     loss_backend: str = DEFAULTS["loss_backend"],
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"],
     rope_backend: str = DEFAULTS["rope_backend"],
@@ -265,6 +268,8 @@ def resolve_config(
         raise ValueError(f"unknown compile mode {compile_mode!r}")
     if kernel_backend != "torch":
         raise ValueError(f"unknown kernel backend {kernel_backend!r}")
+    if mlp_backend not in {"torch", "triton"}:
+        raise ValueError(f"unknown MLP backend {mlp_backend!r}")
     if loss_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown loss backend {loss_backend!r}")
     if loss_chunk_size is not None and loss_chunk_size < 0:
@@ -351,6 +356,7 @@ def resolve_config(
         attention_window=attention_window,
         attention_full_every=attention_full_every,
         attention_backend="flash_attn_2",
+        mlp_backend=mlp_backend,
         loss_backend=loss_backend,
         rope_backend=rope_backend,
         loss_chunk_size=loss_chunk_size,
@@ -434,6 +440,9 @@ def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
         model_data["attention_full_every"] = None
     model_data.setdefault("rope_fraction", 0.25)
     model_data.pop("mlp_activation", None)
+    model_data.setdefault("mlp_backend", DEFAULTS["mlp_backend"])
+    if model_data.get("mlp_backend") not in {"torch", "triton"}:
+        model_data["mlp_backend"] = DEFAULTS["mlp_backend"]
     model_data.setdefault("loss_backend", DEFAULTS["loss_backend"])
     if model_data.get("loss_backend") not in {"torch", "triton"}:
         model_data["loss_backend"] = DEFAULTS["loss_backend"]

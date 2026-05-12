@@ -237,15 +237,20 @@ class CausalSelfAttention(nn.Module):
         return self.o_proj(y)
 
 
-class MLP(nn.Module):
+class MLP(AcceleratedModule):
+    backend_attr = "mlp_backend"
+
     def __init__(self, config: ModelConfig) -> None:
-        super().__init__()
+        super().__init__(config)
         self.gate_up_proj = nn.Linear(config.n_embd, 2 * config.mlp_hidden, bias=False)
         self.down_proj = nn.Linear(config.mlp_hidden, config.n_embd, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def fwd_torch(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+    def fwd_triton(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(kernels.swiglu_triton(self.gate_up_proj(x)))
 
 
 class Block(nn.Module):
