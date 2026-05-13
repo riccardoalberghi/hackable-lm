@@ -7,7 +7,7 @@ from pathlib import Path
 import lm_eval
 from lm_eval.utils import handle_non_serializable
 
-from lm_eval_simple_lm import SimpleLMHarness
+from lm_eval_hackable_lm import SimpleLMHarness
 from repro import load_trusted_checkpoint
 from tokenizer import tokenizer_manifest
 

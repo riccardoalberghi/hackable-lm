@@ -211,7 +211,7 @@ if triton is not None:
         grad = tl.where(offsets == target, grad - 1.0, grad) / n_rows
         tl.store(row_ptr + offsets, grad, mask=mask)
 
-    @torch.library.triton_op("simple_lm::linear_ce", mutates_args={"logits"})
+    @torch.library.triton_op("hackable_lm::linear_ce", mutates_args={"logits"})
     def _triton_linear_ce(logits: torch.Tensor, targets: torch.Tensor, n_tokens: int) -> torch.Tensor:
         loss_1d = torch.empty(logits.shape[0], dtype=torch.float32, device=logits.device)
         vocab_size = logits.shape[1]
@@ -279,7 +279,7 @@ if triton is not None:
         tl.store(grad_gate_up + gate_up_offsets + cols[None, :], grad * up * dsilu, mask=mask)
         tl.store(grad_gate_up + gate_up_offsets + N_COLS + cols[None, :], grad * silu, mask=mask)
 
-    @torch.library.triton_op("simple_lm::swiglu", mutates_args={})
+    @torch.library.triton_op("hackable_lm::swiglu", mutates_args={})
     def _triton_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
         hidden = gate_up.shape[-1] // 2
         rows = gate_up.numel() // (2 * hidden)
@@ -295,7 +295,7 @@ if triton is not None:
         )
         return out
 
-    @torch.library.triton_op("simple_lm::swiglu_backward", mutates_args={})
+    @torch.library.triton_op("hackable_lm::swiglu_backward", mutates_args={})
     def _triton_swiglu_backward_op(gate_up: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
         hidden = grad_out.shape[-1]
         rows = grad_out.numel() // hidden
@@ -386,7 +386,7 @@ if triton is not None:
         out_ptr = tl.where(is_q, q_out_ptr, k_out_ptr)
         tl.store(out_ptr, x_rot, mask=mask)
 
-    @torch.library.triton_op("simple_lm::qk_norm_rope", mutates_args={})
+    @torch.library.triton_op("hackable_lm::qk_norm_rope", mutates_args={})
     def _triton_qk_norm_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
         q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
         k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -495,7 +495,7 @@ if triton is not None:
         grad_out_ptr = tl.where(is_q, q_grad_out_ptr, k_grad_out_ptr)
         tl.store(grad_out_ptr, grad_x, mask=mask)
 
-    @torch.library.triton_op("simple_lm::qk_norm_rope_backward", mutates_args={})
+    @torch.library.triton_op("hackable_lm::qk_norm_rope_backward", mutates_args={})
     def _triton_qk_norm_rope_backward_op(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -635,8 +635,8 @@ def _qk_norm_rope_backward(
 
 
 if triton is not None:
-    torch.library.register_autograd("simple_lm::swiglu", _swiglu_backward, setup_context=_swiglu_setup)
-    torch.library.register_autograd("simple_lm::qk_norm_rope", _qk_norm_rope_backward, setup_context=_qk_norm_rope_setup)
+    torch.library.register_autograd("hackable_lm::swiglu", _swiglu_backward, setup_context=_swiglu_setup)
+    torch.library.register_autograd("hackable_lm::qk_norm_rope", _qk_norm_rope_backward, setup_context=_qk_norm_rope_setup)
 
 
 def swiglu_triton(gate_up: torch.Tensor) -> torch.Tensor:

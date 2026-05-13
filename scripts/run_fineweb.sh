@@ -32,7 +32,7 @@ RAW_FILE="${RAW_FILE:-data/raw/fineweb_${FINEWEB_CONFIG}_${FINEWEB_DOCS}.jsonl}"
 EVAL_DATA="${EVAL_DATA:-eval_data}"
 TASKS="${TASKS:-hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq,validation_loss}"
 EVAL_LIMIT_PER_TASK="${EVAL_LIMIT_PER_TASK:-128}"
-EXPECTED_TOKENIZER_BACKEND="simple_lm_rustbpe_bytelevel"
+EXPECTED_TOKENIZER_BACKEND="hackable_lm_rustbpe_bytelevel"
 
 export RAW_FILE FINEWEB_DOCS FINEWEB_DATASET FINEWEB_CONFIG FINEWEB_SPLIT
 export DATA_DIR VOCAB_SIZE MIN_FREQUENCY PREPARE_BATCH_SIZE JSONL_TEXT_FIELD VAL_FRACTION EXPECTED_TOKENIZER_BACKEND
@@ -54,15 +54,49 @@ print(f"Tokenizer backend: {TOKENIZER_BACKEND}")
 PY
 
 mkdir -p "$(dirname "$RAW_FILE")"
-if [[ ! -s "$RAW_FILE" ]]; then
+raw_complete=0
+if [[ -s "$RAW_FILE" ]]; then
+  if uv run python - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+path = Path(os.environ["RAW_FILE"])
+limit = int(os.environ["FINEWEB_DOCS"])
+if not path.is_file() or path.stat().st_size == 0:
+    sys.exit(1)
+if limit <= 0:
+    print(f"Using existing FineWeb file {path}")
+    sys.exit(0)
+
+count = 0
+with path.open("rb") as f:
+    for count, _ in enumerate(f, 1):
+        if count >= limit:
+            break
+if count >= limit:
+    print(f"Using existing FineWeb file {path} with at least {limit} documents")
+    sys.exit(0)
+print(f"Existing FineWeb file {path} has {count} documents; expected {limit}. Re-downloading.", file=sys.stderr)
+sys.exit(1)
+PY
+  then
+    raw_complete=1
+  fi
+fi
+
+if [[ "$raw_complete" -ne 1 ]]; then
   uv run python - <<'PY' || {
 import json
 import os
+import sys
+from pathlib import Path
 
 from datasets import load_dataset
 from tqdm.auto import tqdm
 
 out = os.environ["RAW_FILE"]
+tmp = f"{out}.tmp"
 limit = int(os.environ["FINEWEB_DOCS"])
 ds = load_dataset(
     os.environ["FINEWEB_DATASET"],
@@ -72,7 +106,7 @@ ds = load_dataset(
 )
 n = 0
 progress = tqdm(total=limit if limit > 0 else None, unit="docs", desc="Downloading FineWeb")
-with open(out, "w", encoding="utf-8") as f:
+with open(tmp, "w", encoding="utf-8") as f:
     for row in ds:
         if limit > 0 and n >= limit:
             break
@@ -82,10 +116,34 @@ with open(out, "w", encoding="utf-8") as f:
             n += 1
             progress.update(1)
 progress.close()
+if limit > 0 and n < limit:
+    raise RuntimeError(f"downloaded {n} documents, expected {limit}")
+Path(tmp).replace(out)
 print(json.dumps({"output": out, "documents": n}))
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
 PY
-    if [[ -s "$RAW_FILE" ]]; then
-      echo "FineWeb download process exited nonzero after writing $RAW_FILE; continuing with the completed file."
+    if uv run python - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+path = Path(os.environ["RAW_FILE"])
+limit = int(os.environ["FINEWEB_DOCS"])
+if not path.is_file() or path.stat().st_size == 0:
+    sys.exit(1)
+if limit <= 0:
+    sys.exit(0)
+count = 0
+with path.open("rb") as f:
+    for count, _ in enumerate(f, 1):
+        if count >= limit:
+            break
+sys.exit(0 if count >= limit else 1)
+PY
+    then
+      echo "FineWeb download process exited nonzero after completing $RAW_FILE; continuing with the completed file."
     else
       exit 1
     fi
@@ -143,6 +201,7 @@ if mismatches:
     sys.exit(1)
 PY
 then
+  echo "Preparing data in $DATA_DIR with tokenizer training over the full input."
   uv run python prepare_data.py all \
     --input "$RAW_FILE" \
     --vocab-size "$VOCAB_SIZE" \

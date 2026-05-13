@@ -10,7 +10,7 @@ from pathlib import Path
 from types import ModuleType
 
 
-_MODULE_NAME = "_simple_lm_tokenizer"
+_MODULE_NAME = "_hackable_lm_tokenizer"
 _ROOT = Path(__file__).resolve().parent
 _CRATE = _ROOT / "rustbpe"
 

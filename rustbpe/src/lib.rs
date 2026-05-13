@@ -17,7 +17,7 @@ type Pair = (u32, u32);
 type PairKey = u64;
 type MergeValue = u64;
 
-const FORMAT: &str = "simple_lm_rustbpe";
+const FORMAT: &str = "hackable_lm_rustbpe";
 const VERSION: u32 = 1;
 const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+";
 const HEAP_MERGE_MIN_LEN: usize = 24;
@@ -28,7 +28,7 @@ const MAX_CACHED_PIECE_BYTES: usize = 96;
 // start from byte IDs, learn frequent pair merges, and apply merge ranks at
 // encode time. This crate extends that shape with local byte-run
 // pre-tokenization, JSON serialization, special-token handling, batch encoding,
-// and the Python API needed by simple-lm.
+// and the Python API needed by hackable-lm.
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct SerializedMerge {
@@ -1249,7 +1249,7 @@ fn load_from_file(path: &str) -> PyResult<Tokenizer> {
 }
 
 #[pymodule]
-fn _simple_lm_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _hackable_lm_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Encoding>()?;
     m.add_class::<Tokenizer>()?;
     m.add_function(wrap_pyfunction!(train_from_texts, m)?)?;

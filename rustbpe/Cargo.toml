@@ -1,10 +1,10 @@
 [package]
-name = "simple_lm_rustbpe"
+name = "hackable_lm_rustbpe"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "_simple_lm_tokenizer"
+name = "_hackable_lm_tokenizer"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

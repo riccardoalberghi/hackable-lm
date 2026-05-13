@@ -141,7 +141,13 @@ def prepare_all(
     output.mkdir(parents=True, exist_ok=True)
     input_paths = expand_inputs(input_patterns)
     tokenizer_path = output / "tokenizer.json"
-    train_tokenizer(input_paths, tokenizer_path, vocab_size, jsonl_text_field, min_frequency)
+    train_tokenizer(
+        input_paths,
+        tokenizer_path,
+        vocab_size,
+        jsonl_text_field,
+        min_frequency,
+    )
     dtype = np.uint16 if vocab_size <= 65535 else np.uint32
     dtype_name = "uint16" if dtype == np.uint16 else "uint32"
     train_tokens, val_tokens, train_bytes, val_bytes = encode_and_write_splits(

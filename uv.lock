@@ -591,10 +591,10 @@ source = { virtual = "." }
 dependencies = [
     { name = "datasets", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "hackable-lm-rustbpe", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "lm-eval", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "mlflow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "simple-lm-rustbpe", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "tqdm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
@@ -608,16 +608,21 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = ">=4.8.5" },
     { name = "flash-attn", specifier = "==2.8.3" },
+    { name = "hackable-lm-rustbpe", directory = "rustbpe" },
     { name = "lm-eval", specifier = ">=0.4.11" },
     { name = "mlflow", specifier = ">=3.11.1" },
     { name = "numpy", specifier = ">=2.4.4" },
-    { name = "simple-lm-rustbpe", directory = "rustbpe" },
     { name = "torch", specifier = "==2.9.1+cu128", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.3" }]
+
+[[package]]
+name = "hackable-lm-rustbpe"
+version = "0.1.0"
+source = { directory = "rustbpe" }
 
 [[package]]
 name = "hf-xet"
@@ -1629,11 +1634,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/58/15/8b3609fd3830ef7b2
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/f9/0595336914c5619e5f28a1fb793285925a8cd4b432c9da0a987836c7f822/shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686", size = 9755 },
 ]
-
-[[package]]
-name = "simple-lm-rustbpe"
-version = "0.1.0"
-source = { directory = "rustbpe" }
 
 [[package]]
 name = "six"

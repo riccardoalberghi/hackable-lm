@@ -17,7 +17,7 @@ try:
     from lm_eval.api.model import LM
     from lm_eval.api.registry import register_model
 except ImportError as exc:  # pragma: no cover - exercised only when lm-eval is absent.
-    raise ImportError("lm_eval_simple_lm.py requires `uv sync --locked` or an editable lm-evaluation-harness checkout") from exc
+    raise ImportError("lm_eval_hackable_lm.py requires `uv sync --locked` or an editable lm-evaluation-harness checkout") from exc
 
 
 @dataclass
@@ -27,7 +27,7 @@ class _Scored:
     cont_len: int
 
 
-@register_model("hackable_lm", "simple_lm")
+@register_model("hackable_lm")
 class SimpleLMHarness(LM):
     """Minimal EleutherAI lm-evaluation-harness adapter for this repo."""
 
@@ -48,7 +48,7 @@ class SimpleLMHarness(LM):
         self._batch_size = int(batch_size)
         self._dtype = getattr(torch, dtype) if dtype else None
         if self._device.type == "cuda" and self._dtype not in {None, torch.bfloat16}:
-            raise RuntimeError("simple-lm checkpoints use bf16 weights on CUDA; pass dtype=bfloat16")
+            raise RuntimeError("hackable-lm checkpoints use bf16 weights on CUDA; pass dtype=bfloat16")
 
         ckpt = load_trusted_checkpoint(checkpoint, map_location="cpu")
         self._config = config_from_dict(ckpt["config"])

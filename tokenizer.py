@@ -7,7 +7,7 @@ from typing import Iterable
 from _rustbpe import Tokenizer, load_from_file, train_from_iterator
 
 SPECIAL_TOKENS = ["<|endoftext|>"]
-TOKENIZER_BACKEND = "simple_lm_rustbpe_bytelevel"
+TOKENIZER_BACKEND = "hackable_lm_rustbpe_bytelevel"
 
 
 def iter_texts(paths: Iterable[str | Path], jsonl_text_field: str = "text") -> Iterable[str]:

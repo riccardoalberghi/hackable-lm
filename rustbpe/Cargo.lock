@@ -86,6 +86,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hackable_lm_rustbpe"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "dary_heap",
+ "memchr",
+ "pyo3",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -322,20 +336,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "simple_lm_rustbpe"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "dary_heap",
- "memchr",
- "pyo3",
- "rayon",
- "regex",
- "serde",
- "serde_json",
 ]
 
 [[package]]
