@@ -76,7 +76,7 @@ def compile_training_model(
     if not enabled:
         return model
     configure_torch_compile(capture_scalar_outputs)
-    return torch.compile(model, mode=None if mode == "default" else mode)
+    return torch.compile(model, mode=None if mode == "default" else mode, dynamic=False, fullgraph=True)
 
 
 def mark_compiled_step_begin(enabled: bool) -> None:

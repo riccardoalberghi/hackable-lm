@@ -686,7 +686,7 @@ def main() -> None:
             with timed_phase(timer, "grad_norm"):
                 if args.max_grad_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, args.max_grad_norm, foreach=True)
-                else:
+                elif log_this_step:
                     grad_norm = grad_global_norm(clip_params)
             with timed_phase(timer, "lr_update"):
                 lr_mult = lr_multiplier(step, config.num_iterations, config.warmup_steps, config.warmdown_ratio, config.final_lr_frac, config.lr_scheduler)

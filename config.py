@@ -30,7 +30,7 @@ DEFAULTS = {
     "warmup_ratio": 0.05,
     "warmdown_ratio": 0.3,
     "final_lr_frac": 0.1,
-    "compile_mode": "max-autotune-no-cudagraphs",
+    "compile_mode": "max-autotune",
     "compile_capture_scalar_outputs": True,
     "mlp_backend": "triton",
     "loss_backend": "triton",
