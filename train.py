@@ -306,15 +306,31 @@ def format_timing_record(timing: dict[str, Any]) -> str:
 def training_data_info(loader: MemmapDataLoader, *, overfit_first_batch: bool) -> dict[str, Any]:
     info = loader.info()
     info["overfit_first_batch"] = overfit_first_batch
-    if overfit_first_batch:
-        info["sampling_policy"] = "repeat_first_random_packed_spans_batch"
     return info
 
 
-def next_train_batch(prefetcher, fixed_batch):
+def validation_batch_count(start_step: int, num_iterations: int, log_interval: int, val_interval: int, val_batches: int) -> int:
+    count = 0
+    for step in range(start_step, num_iterations):
+        log_this_step = step % log_interval == 0 or step == num_iterations - 1
+        if log_this_step and step % val_interval == 0 and step != start_step:
+            count += val_batches
+    return count
+
+
+def require_scheduled_data(loader: MemmapDataLoader, config, args, start_step: int, *, validate_rank: bool) -> None:
+    remaining_steps = max(0, config.num_iterations - start_step)
+    train_batches = 1 if args.overfit_first_batch and remaining_steps > 0 else remaining_steps * config.gradient_accumulation_steps
+    loader.require_batches("train", train_batches, config.device_batch_size)
+    if validate_rank:
+        val_batches = validation_batch_count(start_step, config.num_iterations, args.log_interval, args.val_interval, args.val_batches)
+        loader.require_batches("val", val_batches, config.device_batch_size)
+
+
+def next_train_batch(prefetcher, fixed_batch, *, prepare_next: bool = True):
     if fixed_batch is not None:
         return fixed_batch
-    return prefetcher.next()
+    return prefetcher.next(prepare_next=prepare_next)
 
 
 @torch.no_grad()
@@ -414,6 +430,8 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
         args.rope_backend = model_cfg.get("rope_backend")
     if args.seed is None:
         args.seed = manifest.get("seed")
+    if getattr(args, "data_shuffle_seed", None) is None:
+        args.data_shuffle_seed = _nested(manifest, "data", "data_shuffle_seed")
     if args.target_param_data_ratio is None:
         args.target_param_data_ratio = cfg.get("target_param_data_ratio")
         if args.target_param_data_ratio is None and cfg.get("scaling_params"):
@@ -461,6 +479,7 @@ def main() -> None:
     parser.add_argument("--data", required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--data-shuffle-seed", type=int)
     parser.add_argument("--sequence-len", type=int)
     parser.add_argument("--attention-window", type=int, help="local causal attention window; use 0 for full attention")
     parser.add_argument("--attention-full-every", type=int, help="make every Nth layer full attention after local layers; use 0 for no periodic full layers")
@@ -515,6 +534,7 @@ def main() -> None:
     if matched_manifest:
         apply_match_run_defaults(args, matched_manifest)
     args.seed = args.seed if args.seed is not None else 1337
+    args.data_shuffle_seed = args.data_shuffle_seed if args.data_shuffle_seed is not None else 1337
     args.sequence_len = args.sequence_len if args.sequence_len is not None else DEFAULTS["sequence_len"]
     args.attention_window = args.attention_window if args.attention_window is not None else DEFAULTS["attention_window"]
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
@@ -590,15 +610,30 @@ def main() -> None:
         rope_backend=config.model.rope_backend,
         mlp_backend=config.model.mlp_backend,
     ).to_dict()
-    loader = MemmapDataLoader(args.data, config.sequence_len, seed=args.seed + int(ddp["rank"]))
+    loader = MemmapDataLoader(
+        args.data,
+        config.sequence_len,
+        data_shuffle_seed=args.data_shuffle_seed,
+        rank=int(ddp["rank"]),
+        world_size=int(ddp["world_size"]),
+    )
+    start_step = 0
+    tokens_seen = 0
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = load_trusted_checkpoint(args.resume, map_location="cpu")
+        if resume_ckpt["config"]["model"] != config.to_dict()["model"]:
+            raise RuntimeError("checkpoint model config does not match requested config")
+        start_step = resume_ckpt["step"] + 1
+        tokens_seen = resume_ckpt["tokens_seen"]
+    require_scheduled_data(loader, config, args, start_step, validate_rank=is_main)
+
     raw_model = LanguageModel(config.model).to(device)
     raw_model.prepare_compile_cache(config.sequence_len, device)
     raw_model = apply_precision_policy(raw_model, config.precision)
     optimizer = create_optimizer(raw_model, config)
     clip_params = [p for p in raw_model.parameters() if p.requires_grad]
 
-    start_step = 0
-    tokens_seen = 0
     run_dir = Path(args.runs_dir) / args.run_name
     manifest = None
     if is_main:
@@ -622,9 +657,9 @@ def main() -> None:
         manifest = manifest_box[0]
     mlflow = _start_mlflow(args, run_dir, manifest) if is_main else None
     if args.resume:
-        ckpt = load_trusted_checkpoint(args.resume, map_location="cpu")
-        if ckpt["config"]["model"] != config.to_dict()["model"]:
-            raise RuntimeError("checkpoint model config does not match requested config")
+        ckpt = resume_ckpt
+        if ckpt is None:
+            raise RuntimeError("resume checkpoint was not loaded")
         resume_manifest = ckpt.get("run_manifest")
         if resume_manifest:
             resume_warnings = compatibility_warnings(resume_manifest, manifest)
@@ -638,14 +673,12 @@ def main() -> None:
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         restore_rng_state(ckpt["rng_state"])
-        start_step = ckpt["step"] + 1
-        tokens_seen = ckpt["tokens_seen"]
 
     model = compile_training_model(raw_model, config.compile, config.compile_mode, config.compile_capture_scalar_outputs)
     if ddp["enabled"]:
         model = DistributedDataParallel(model, device_ids=[int(ddp["local_rank"])], output_device=int(ddp["local_rank"]))
     train_prefetcher = loader.cuda_prefetcher("train", config.device_batch_size, device)
-    fixed_train_batch = train_prefetcher.next() if args.overfit_first_batch else None
+    fixed_train_batch = train_prefetcher.next(prepare_next=False) if args.overfit_first_batch else None
     train_log = (run_dir / "train_log.jsonl").open("a", encoding="utf-8") if is_main else None
     timing_log = (run_dir / "timing_log.jsonl").open("a", encoding="utf-8") if is_main and args.timing_interval > 0 else None
     torch.cuda.reset_peak_memory_stats()
@@ -672,14 +705,12 @@ def main() -> None:
                     else model.no_sync()
                 )
                 with sync_context:
+                    more_train_batches = step != config.num_iterations - 1 or micro_step != config.gradient_accumulation_steps - 1
                     with timed_phase(timer, "data_wait"):
-                        x, y = next_train_batch(train_prefetcher, fixed_train_batch)
+                        x, y = next_train_batch(train_prefetcher, fixed_train_batch, prepare_next=more_train_batches)
                     with timed_phase(timer, "forward_backward"):
                         _, loss = model(x, y)
                         (loss / config.gradient_accumulation_steps).backward()
-                    if fixed_train_batch is None:
-                        with timed_phase(timer, "prefetch"):
-                            train_prefetcher.preload()
                     if log_this_step:
                         detached_loss = loss.detach().clone()
                         total_loss = detached_loss if total_loss is None else total_loss + detached_loss
@@ -744,6 +775,7 @@ def main() -> None:
                     "kernel_backends": kernel_info,
                     "run_id": args.run_name,
                     "seed": args.seed,
+                    "data_shuffle_seed": args.data_shuffle_seed,
                     "data_hash": data_manifest["tokenizer_hash"],
                     "overfit_first_batch": args.overfit_first_batch,
                 }

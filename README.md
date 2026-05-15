@@ -28,7 +28,7 @@ MFU* is usually in the high 50s to low 60s, reported against the standard bf16 p
 ## What Is Here
 
 - byte-level BPE tokenizer with a local Rust backend
-- packed token memmap preprocessing
+- document-offset token memmap preprocessing
 - decoder-only causal LM in `model.py`
 - RoPE, RMSNorm, QK norm, SwiGLU MLPs, fused QKV and fused gate/up projections
 - local-window attention with periodic full attention
@@ -108,8 +108,8 @@ The intended workflow is boring on purpose:
 4. Compare the manifests and metrics.
 
 For fair comparisons, keep the boring fields aligned: data hashes, tokenizer
-hash, split seed, sequence length, global batch tokens, optimizer grouping,
-precision, kernel backend, scaling policy, and seed.
+hash, split seed, data shuffle seed, sequence length, global batch tokens,
+optimizer grouping, precision, kernel backend, scaling policy, and seed.
 
 When a candidate should inherit the baseline budget, use `--match-run`:
 

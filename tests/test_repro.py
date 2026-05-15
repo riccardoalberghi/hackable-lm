@@ -14,17 +14,31 @@ from conftest import requires_torch, torch
 def test_manifest_compatibility() -> None:
     from repro import compatibility_warnings
 
-    base = {"config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16"}, "seed": 1, "data": {"manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}}}}
+    base = {
+        "config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16"},
+        "seed": 1,
+        "data": {"data_shuffle_seed": 7, "manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}}},
+    }
     other = json.loads(json.dumps(base))
     assert compatibility_warnings(base, other) == []
     other["seed"] = 2
     assert compatibility_warnings(base, other)
+    other = json.loads(json.dumps(base))
+    other["data"]["data_shuffle_seed"] = 8
+    assert "data shuffle seed differs" in compatibility_warnings(base, other)[0]
 
 
 @requires_torch
 def test_repro_compare_cli(tmp_path: Path) -> None:
     pytest.importorskip("numpy")
-    base = {"config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16"}, "seed": 1, "data": {"manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}, "split_seed": 1}}}
+    base = {
+        "config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16"},
+        "seed": 1,
+        "data": {
+            "data_shuffle_seed": 7,
+            "manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}, "split_seed": 1},
+        },
+    }
     same = json.loads(json.dumps(base))
     different = json.loads(json.dumps(base))
     different["seed"] = 2

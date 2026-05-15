@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import glob
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import numpy as np
 
 from repro import hash_file
 from tokenizer import (
+    EOS_TOKEN,
     SPECIAL_TOKENS,
     TOKENIZER_BACKEND,
     iter_texts,
@@ -49,27 +51,15 @@ def append_ids(path: Path, ids: list[int], dtype: np.dtype) -> int:
     return int(arr.size)
 
 
-def rebalance_empty_split(output: Path, dtype: np.dtype, val_fraction: float, train_bytes: int, val_bytes: int) -> tuple[int, int, int, int]:
-    train_path = output / "train.bin"
-    val_path = output / "val.bin"
-    train = np.fromfile(train_path, dtype=dtype) if train_path.exists() else np.asarray([], dtype=dtype)
-    val = np.fromfile(val_path, dtype=dtype) if val_path.exists() else np.asarray([], dtype=dtype)
-    all_ids = np.concatenate([train, val])
-    if all_ids.size < 2:
-        raise RuntimeError("need at least two tokens to create non-empty train and validation splits")
-    val_count = min(all_ids.size - 1, max(1, int(round(all_ids.size * val_fraction))))
-    train_ids = all_ids[:-val_count]
-    val_ids = all_ids[-val_count:]
-    train_ids.tofile(train_path)
-    val_ids.tofile(val_path)
-    total_bytes = train_bytes + val_bytes
-    if total_bytes > 0:
-        val_byte_count = min(total_bytes - 1, max(1, int(round(total_bytes * val_fraction))))
-        train_byte_count = total_bytes - val_byte_count
-    else:
-        train_byte_count = 0
-        val_byte_count = 0
-    return int(train_ids.size), int(val_ids.size), train_byte_count, val_byte_count
+def save_document_offsets(output: Path, split: str, offsets: array) -> None:
+    np.save(output / f"{split}_offsets.npy", np.asarray(offsets, dtype=np.uint64))
+
+
+def split_stats(offsets: array, doc_text_bytes: array) -> dict[str, int]:
+    return {
+        "tokens": int(offsets[-1]),
+        "text_bytes": int(sum(doc_text_bytes)),
+    }
 
 
 def encode_and_write_splits(
@@ -81,19 +71,26 @@ def encode_and_write_splits(
     val_fraction: float,
     split_seed: int,
     batch_size: int,
-) -> tuple[int, int, int, int]:
+) -> dict[str, int]:
     tok = load_tokenizer(tokenizer_path)
-    eos_id = tok.token_to_id(SPECIAL_TOKENS[0])
+    eos_id = tok.token_to_id(EOS_TOKEN)
+    if eos_id is None:
+        raise RuntimeError(f"tokenizer is missing required special token {EOS_TOKEN!r}")
     dtype = np.uint16 if vocab_size <= 65535 else np.uint32
     train_path = output / "train.bin"
     val_path = output / "val.bin"
-    train_path.unlink(missing_ok=True)
-    val_path.unlink(missing_ok=True)
+    for path in (
+        train_path,
+        val_path,
+        output / "train_offsets.npy",
+        output / "val_offsets.npy",
+    ):
+        path.unlink(missing_ok=True)
+    train_path.touch()
+    val_path.touch()
     rng = np.random.default_rng(split_seed)
-    train_tokens = 0
-    val_tokens = 0
-    train_bytes = 0
-    val_bytes = 0
+    offsets = {"train": array("Q", [0]), "val": array("Q", [0])}
+    doc_text_bytes = {"train": array("Q"), "val": array("Q")}
     try:
         from tqdm.auto import tqdm
     except ImportError:
@@ -101,30 +98,42 @@ def encode_and_write_splits(
     progress = tqdm(desc="Tokenizing corpus", unit="docs") if tqdm is not None else None
     for texts in batched(iter_texts(input_paths, jsonl_text_field), batch_size):
         encodings = tok.encode_batch(texts)
-        train_ids: list[int] = []
-        val_ids: list[int] = []
+        pending_ids = {"train": [], "val": []}
+        pending_lengths: dict[str, list[int]] = {"train": [], "val": []}
+        pending_text_bytes: dict[str, list[int]] = {"train": [], "val": []}
         for text, encoding in zip(texts, encodings):
             ids = encoding.ids
-            if eos_id is not None:
-                ids.append(eos_id)
+            ids.append(eos_id)
             text_bytes = len(text.encode("utf-8"))
-            if rng.random() < val_fraction:
-                val_ids.extend(ids)
-                val_bytes += text_bytes
-            else:
-                train_ids.extend(ids)
-                train_bytes += text_bytes
-        if train_ids:
-            train_tokens += append_ids(train_path, train_ids, dtype)
-        if val_ids:
-            val_tokens += append_ids(val_path, val_ids, dtype)
+            split = "val" if rng.random() < val_fraction else "train"
+            pending_ids[split].extend(ids)
+            pending_lengths[split].append(len(ids))
+            pending_text_bytes[split].append(text_bytes)
+        for split, path in (("train", train_path), ("val", val_path)):
+            if not pending_ids[split]:
+                continue
+            append_ids(path, pending_ids[split], dtype)
+            for length, text_bytes in zip(pending_lengths[split], pending_text_bytes[split]):
+                offsets[split].append(offsets[split][-1] + length)
+                doc_text_bytes[split].append(text_bytes)
         if progress is not None:
             progress.update(len(texts))
     if progress is not None:
         progress.close()
-    if val_tokens == 0 or train_tokens == 0:
-        return rebalance_empty_split(output, dtype, val_fraction, train_bytes, val_bytes)
-    return train_tokens, val_tokens, train_bytes, val_bytes
+    if len(offsets["train"]) == 1 and len(offsets["val"]) == 1:
+        raise RuntimeError("no documents were found in the input data")
+    if len(offsets["train"]) == 1 or len(offsets["val"]) == 1:
+        raise RuntimeError("document split produced an empty train or validation split")
+    save_document_offsets(output, "train", offsets["train"])
+    save_document_offsets(output, "val", offsets["val"])
+    train_stats = split_stats(offsets["train"], doc_text_bytes["train"])
+    val_stats = split_stats(offsets["val"], doc_text_bytes["val"])
+    return {
+        "train_tokens": train_stats["tokens"],
+        "val_tokens": val_stats["tokens"],
+        "train_text_bytes": train_stats["text_bytes"],
+        "val_text_bytes": val_stats["text_bytes"],
+    }
 
 
 def prepare_all(
@@ -150,7 +159,7 @@ def prepare_all(
     )
     dtype = np.uint16 if vocab_size <= 65535 else np.uint32
     dtype_name = "uint16" if dtype == np.uint16 else "uint32"
-    train_tokens, val_tokens, train_bytes, val_bytes = encode_and_write_splits(
+    split_stats = encode_and_write_splits(
         input_paths,
         tokenizer_path,
         output,
@@ -175,14 +184,13 @@ def prepare_all(
         "split_seed": split_seed,
         "split_policy": "streaming_document_bernoulli",
         "val_fraction": val_fraction,
-        "train_tokens": train_tokens,
-        "val_tokens": val_tokens,
-        "train_text_bytes": train_bytes,
-        "val_text_bytes": val_bytes,
+        "train_tokens": split_stats["train_tokens"],
+        "val_tokens": split_stats["val_tokens"],
+        "train_text_bytes": split_stats["train_text_bytes"],
+        "val_text_bytes": split_stats["val_text_bytes"],
         "dtype": dtype_name,
         "jsonl_text_field": jsonl_text_field,
         "tokenize_batch_size": batch_size,
-        "preprocessing": f"{TOKENIZER_BACKEND}_packed_contiguous",
         "prepare_data_code_hash": hash_file(Path(__file__)),
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -190,7 +198,7 @@ def prepare_all(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train tokenizer and build packed token memmaps.")
+    parser = argparse.ArgumentParser(description="Train tokenizer and build document-offset token memmaps.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     all_p = sub.add_parser("all")
     all_p.add_argument("--input", nargs="+", required=True)
@@ -213,7 +221,15 @@ def main() -> None:
             args.min_frequency,
             args.batch_size,
         )
-        print(json.dumps({"output": args.output, "train_tokens": manifest["train_tokens"], "val_tokens": manifest["val_tokens"]}))
+        print(
+            json.dumps(
+                {
+                    "output": args.output,
+                    "train_tokens": manifest["train_tokens"],
+                    "val_tokens": manifest["val_tokens"],
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

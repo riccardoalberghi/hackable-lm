@@ -98,7 +98,8 @@ def main() -> None:
         if task == "validation_loss":
             if not args.data:
                 raise ValueError("--data is required for validation_loss")
-            loader = MemmapDataLoader(args.data, config.sequence_len, seed=args.seed)
+            data_shuffle_seed = manifest.get("data", {}).get("data_shuffle_seed", args.seed)
+            loader = MemmapDataLoader(args.data, config.sequence_len, data_shuffle_seed=int(data_shuffle_seed))
             value = validation_loss(model, loader, device, batches=16, batch_size=min(4, config.device_batch_size))
             data_manifest = loader.manifest
             details = {}
@@ -135,6 +136,7 @@ def main() -> None:
                 "tokenizer_hash": manifest.get("data", {}).get("manifest", {}).get("tokenizer_hash"),
                 "raw_input_sha256": manifest.get("data", {}).get("manifest", {}).get("raw_input_sha256"),
                 "split_seed": manifest.get("data", {}).get("manifest", {}).get("split_seed"),
+                "data_shuffle_seed": manifest.get("data", {}).get("data_shuffle_seed"),
             },
             "tokenizer": manifest.get("tokenizer"),
             "config": {

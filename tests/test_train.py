@@ -22,15 +22,24 @@ def test_training_data_info_marks_first_batch_overfit() -> None:
 
     class Loader:
         def info(self) -> dict:
-            return {"sampling_policy": "random_packed_spans", "block_size": 8}
+            return {"data_shuffle_seed": 123, "block_size": 8}
 
     normal = training_data_info(Loader(), overfit_first_batch=False)
-    assert normal["sampling_policy"] == "random_packed_spans"
+    assert normal["data_shuffle_seed"] == 123
     assert normal["overfit_first_batch"] is False
 
     overfit = training_data_info(Loader(), overfit_first_batch=True)
-    assert overfit["sampling_policy"] == "repeat_first_random_packed_spans_batch"
+    assert overfit["data_shuffle_seed"] == 123
     assert overfit["overfit_first_batch"] is True
+
+
+@requires_torch
+def test_validation_batch_count_matches_training_schedule() -> None:
+    from train import validation_batch_count
+
+    assert validation_batch_count(start_step=0, num_iterations=11, log_interval=1, val_interval=5, val_batches=3) == 6
+    assert validation_batch_count(start_step=5, num_iterations=11, log_interval=1, val_interval=5, val_batches=3) == 3
+    assert validation_batch_count(start_step=0, num_iterations=11, log_interval=10, val_interval=5, val_batches=3) == 3
 
 
 @requires_torch
@@ -96,9 +105,9 @@ def test_next_train_batch_reuses_fixed_batch_without_advancing_prefetcher() -> N
         def __init__(self) -> None:
             self.calls = 0
 
-        def next(self):
+        def next(self, prepare_next: bool = True):
             self.calls += 1
-            return ("fresh", self.calls)
+            return ("fresh", self.calls, prepare_next)
 
     prefetcher = Prefetcher()
     fixed = ("fixed", 0)
@@ -106,7 +115,7 @@ def test_next_train_batch_reuses_fixed_batch_without_advancing_prefetcher() -> N
     assert next_train_batch(prefetcher, fixed) == fixed
     assert next_train_batch(prefetcher, fixed) == fixed
     assert prefetcher.calls == 0
-    assert next_train_batch(prefetcher, None) == ("fresh", 1)
+    assert next_train_batch(prefetcher, None, prepare_next=False) == ("fresh", 1, False)
 
 
 @requires_torch

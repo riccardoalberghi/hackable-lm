@@ -6,7 +6,9 @@ from typing import Iterable
 
 from _rustbpe import Tokenizer, load_from_file, train_from_iterator
 
-SPECIAL_TOKENS = ["<|endoftext|>"]
+EOS_TOKEN = "<|endoftext|>"
+BOS_TOKEN = "<|beginofsequence|>"
+SPECIAL_TOKENS = [EOS_TOKEN, BOS_TOKEN]
 TOKENIZER_BACKEND = "hackable_lm_rustbpe_bytelevel"
 
 
@@ -53,7 +55,7 @@ def load_tokenizer(path: str | Path) -> Tokenizer:
 def encode(tokenizer, text: str, add_eos: bool = True) -> list[int]:
     ids = tokenizer.encode(text).ids
     if add_eos:
-        eos_id = tokenizer.token_to_id(SPECIAL_TOKENS[0])
+        eos_id = tokenizer.token_to_id(EOS_TOKEN)
         if eos_id is not None:
             ids.append(eos_id)
     return ids

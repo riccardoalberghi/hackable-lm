@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from tokenizer import (
+    BOS_TOKEN,
+    EOS_TOKEN,
     SPECIAL_TOKENS,
     TOKENIZER_BACKEND,
     decode,
@@ -37,14 +39,15 @@ def test_rust_tokenizer_exposes_existing_api_shape(tmp_path: Path) -> None:
     assert one
     assert batch[0]
     assert batch[1] == one
-    assert tok.token_to_id(SPECIAL_TOKENS[0]) == 0
+    assert tok.token_to_id(EOS_TOKEN) == 0
+    assert tok.token_to_id(BOS_TOKEN) == 1
     assert tok.get_vocab_size() > 256
 
 
 def test_encode_appends_eos_and_decode_skips_specials(tmp_path: Path) -> None:
     tok, _ = _train(tmp_path, "hello\n")
     ids = encode(tok, "hello", add_eos=True)
-    assert ids[-1] == tok.token_to_id(SPECIAL_TOKENS[0])
+    assert ids[-1] == tok.token_to_id(EOS_TOKEN)
     assert decode(tok, ids) == "hello"
 
 
@@ -75,15 +78,19 @@ def test_manifest_records_rust_backend(tmp_path: Path) -> None:
 def test_prepare_all_uses_rust_tokenizer_without_torch(tmp_path: Path) -> None:
     from prepare_data import prepare_all
 
-    raw = tmp_path / "raw.txt"
-    raw.write_text("hello world\n" * 40, encoding="utf-8")
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text(
+        "\n".join(json.dumps({"text": f"hello world document {i}"}) for i in range(40)),
+        encoding="utf-8",
+    )
     out = tmp_path / "processed"
     manifest = prepare_all([str(raw)], out, vocab_size=300, val_fraction=0.2, min_frequency=1)
     assert (out / "tokenizer.json").exists()
     assert (out / "train.bin").exists()
     assert (out / "val.bin").exists()
+    assert (out / "train_offsets.npy").exists()
+    assert (out / "val_offsets.npy").exists()
     assert manifest["tokenizer_backend"] == TOKENIZER_BACKEND
-    assert manifest["preprocessing"] == f"{TOKENIZER_BACKEND}_packed_contiguous"
     assert manifest["min_frequency"] == 1
     assert manifest["vocab_size"] <= 300
     assert manifest["train_tokens"] > 0

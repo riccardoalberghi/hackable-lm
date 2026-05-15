@@ -60,6 +60,7 @@ def main() -> None:
                 "tokenizer_hash": run_manifest.get("data", {}).get("manifest", {}).get("tokenizer_hash"),
                 "raw_input_sha256": run_manifest.get("data", {}).get("manifest", {}).get("raw_input_sha256"),
                 "split_seed": run_manifest.get("data", {}).get("manifest", {}).get("split_seed"),
+                "data_shuffle_seed": run_manifest.get("data", {}).get("data_shuffle_seed"),
             },
             "config": {
                 "depth": run_manifest.get("config", {}).get("depth"),

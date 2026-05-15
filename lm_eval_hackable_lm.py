@@ -10,7 +10,7 @@ from config import config_from_dict
 from kernels import apply_precision_policy
 from model import LanguageModel
 from repro import load_trusted_checkpoint
-from tokenizer import SPECIAL_TOKENS, load_tokenizer
+from tokenizer import EOS_TOKEN, load_tokenizer
 
 try:
     from lm_eval.api.instance import Instance
@@ -64,7 +64,7 @@ class SimpleLMHarness(LM):
         tokenizer_path = tokenizer or str(Path(manifest_data.get("data_dir", ".")).joinpath("tokenizer.json"))
         self.tokenizer_path = Path(tokenizer_path)
         self.tokenizer = load_tokenizer(self.tokenizer_path)
-        self._eot_token_id = self.tokenizer.token_to_id(SPECIAL_TOKENS[0])
+        self._eot_token_id = self.tokenizer.token_to_id(EOS_TOKEN)
         if self._eot_token_id is None:
             self._eot_token_id = 0
 

@@ -169,7 +169,6 @@ expected = {
     "min_frequency": int(os.environ["MIN_FREQUENCY"]),
     "tokenize_batch_size": int(os.environ["PREPARE_BATCH_SIZE"]),
     "jsonl_text_field": os.environ["JSONL_TEXT_FIELD"],
-    "preprocessing": f"{os.environ['EXPECTED_TOKENIZER_BACKEND']}_packed_contiguous",
 }
 mismatches = [
     f"{key}: expected {value!r}, found {manifest.get(key)!r}"
@@ -190,7 +189,7 @@ val_fraction = float(os.environ["VAL_FRACTION"])
 if not math.isclose(float(manifest.get("val_fraction", -1.0)), val_fraction, rel_tol=0.0, abs_tol=1e-12):
     mismatches.append(f"val_fraction: expected {val_fraction!r}, found {manifest.get('val_fraction')!r}")
 
-for name in ("tokenizer.json", "train.bin", "val.bin"):
+for name in ("tokenizer.json", "train.bin", "val.bin", "train_offsets.npy", "val_offsets.npy"):
     if not (manifest_path.parent / name).is_file():
         mismatches.append(f"missing {name}")
 

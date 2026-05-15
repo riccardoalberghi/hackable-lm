@@ -227,9 +227,9 @@ BASE_COMPARISON_FIELDS = [
     ("optimizer_grouping", "optimizer grouping"),
     ("lr_schedule", "LR schedule"),
     ("seed", "seed"),
+    ("data.data_shuffle_seed", "data shuffle seed"),
     ("data.manifest.tokenizer_backend", "tokenizer backend"),
     ("data.manifest.tokenizer_hash", "tokenizer hash"),
-    ("data.manifest.preprocessing", "preprocessing"),
     ("data.manifest.raw_input_sha256", "data hashes"),
     ("data.manifest.split_seed", "train/val split seed"),
 ]
