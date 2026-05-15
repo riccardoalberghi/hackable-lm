@@ -40,6 +40,7 @@ def test_model_forward_and_optimizer_grouping() -> None:
     assert loss is None
     opt = create_optimizer(model, cfg)
     summary = opt.summary()
+    assert summary["optimizer_kind"] == "muon_adamw"
     assert summary["muon_tensors"] == 7 * cfg.model.n_layer
     assert summary["adamw_tensors"] > 0
     split_groups = [group for group in opt.param_groups if group["kind"] == "muon" and group.get("split_sizes")]
@@ -51,6 +52,43 @@ def test_model_forward_and_optimizer_grouping() -> None:
         ),
         (cfg.model.mlp_hidden, cfg.model.mlp_hidden),
     ]
+
+
+@requires_torch
+def test_adamw_optimizer_mode_groups_all_trainable_params() -> None:
+    from model import LanguageModel
+    from optim import create_optimizer
+
+    cfg = resolve_config(
+        depth=2,
+        vocab_size=128,
+        sequence_len=8,
+        attention_window=4,
+        device_batch_size=2,
+        precision="fp32_test",
+        compile_model=False,
+        loss_backend="torch",
+        optimizer="adamw",
+    )
+    model = LanguageModel(cfg.model)
+    opt = create_optimizer(model, cfg)
+    summary = opt.summary()
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    assert summary["optimizer_kind"] == "adamw"
+    assert summary["muon_tensors"] == 0
+    assert summary["muon_params"] == 0
+    assert summary["adamw_params"] == trainable_params
+    assert summary["matrix_params"] > 0
+    assert opt.muon_lr is None
+    assert opt.muon_momentum is None
+    assert all(group["kind"] == "adamw" for group in opt.param_groups)
+
+    matrix_param = dict(model.named_parameters())["blocks.0.attn.qkv_proj.weight"]
+    before = matrix_param.detach().clone()
+    matrix_param.grad = torch.ones_like(matrix_param)
+    opt.step()
+    assert not torch.allclose(matrix_param, before)
 
 
 @requires_torch

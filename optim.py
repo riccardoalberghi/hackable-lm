@@ -82,8 +82,8 @@ class MuonAdamW(torch.optim.Optimizer):
         super().__init__(param_groups, defaults={})
         self.excluded = [] if excluded is None else excluded
         muon_group = self._first_muon_group()
-        self.muon_momentum = muon_group.get("momentum", 0.95)
-        self.muon_lr = muon_group.get("lr", 0.0)
+        self.muon_momentum = muon_group.get("momentum", 0.95) if muon_group is not None else None
+        self.muon_lr = muon_group.get("lr", 0.0) if muon_group is not None else None
 
         self._adamw_step_t = torch.tensor(0.0, dtype=OPTIMIZER_SCALAR_DTYPE, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=OPTIMIZER_SCALAR_DTYPE, device="cpu")
@@ -96,11 +96,11 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=OPTIMIZER_SCALAR_DTYPE, device="cpu")
         self._muon_weight_decay_t = torch.tensor(0.0, dtype=OPTIMIZER_SCALAR_DTYPE, device="cpu")
 
-    def _first_muon_group(self) -> dict[str, Any]:
+    def _first_muon_group(self) -> dict[str, Any] | None:
         for group in self.param_groups:
             if group["kind"] == "muon":
                 return group
-        raise RuntimeError("MuonAdamW needs at least one Muon parameter group")
+        return None
 
     def _step_adamw(self, group: dict[str, Any]) -> None:
         beta1, beta2 = group["betas"]
@@ -332,7 +332,7 @@ class MuonAdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             group["lr"] = group["base_lr"] * mult
         muon_group = self._first_muon_group()
-        self.muon_lr = muon_group["lr"]
+        self.muon_lr = muon_group["lr"] if muon_group is not None else None
 
     def summary(self) -> dict[str, Any]:
         groups = [
@@ -349,11 +349,14 @@ class MuonAdamW(torch.optim.Optimizer):
         muon_groups = [group for group in self.param_groups if group["kind"] == "muon"]
         adamw_groups = [group for group in self.param_groups if group["kind"] == "adamw"]
         return {
+            "optimizer_kind": "muon_adamw" if muon_groups else "adamw",
             "muon_tensors": sum(len(group["params"]) * len(group.get("split_sizes") or (None,)) for group in muon_groups),
             "adamw_tensors": sum(len(group["params"]) for group in adamw_groups),
             "muon_params": sum(p.numel() for group in muon_groups for p in group["params"]),
+            "adamw_params": sum(p.numel() for group in adamw_groups for p in group["params"]),
             "embedding_params": _group_param_count(self.param_groups, "embedding"),
             "unembedding_params": _group_param_count(self.param_groups, "unembedding"),
+            "matrix_params": _group_param_count(self.param_groups, "matrix"),
             "scalar_params": _group_param_count(self.param_groups, "scalar_vector"),
             "excluded": self.excluded,
             "groups": groups,
@@ -398,6 +401,10 @@ def _adamw_group(name: str, params: list[torch.nn.Parameter], lr: float, weight_
 
 
 def create_optimizer(model: torch.nn.Module, config: Any) -> MuonAdamW:
+    optimizer_kind = getattr(config, "optimizer", "muon_adamw")
+    if optimizer_kind not in {"muon_adamw", "adamw"}:
+        raise ValueError(f"unknown optimizer {optimizer_kind!r}")
+
     muon_params: list[tuple[str, torch.nn.Parameter, tuple[int, ...] | None]] = []
     embedding_params: list[torch.nn.Parameter] = []
     unembedding_params: list[torch.nn.Parameter] = []
@@ -419,8 +426,18 @@ def create_optimizer(model: torch.nn.Module, config: Any) -> MuonAdamW:
     param_groups = [
         _adamw_group("embedding", embedding_params, config.embedding_lr, config.weight_decay),
         _adamw_group("unembedding", unembedding_params, config.unembedding_lr, config.weight_decay),
-        _adamw_group("scalar_vector", scalar_params, config.scalar_lr, 0.0),
     ]
+    if optimizer_kind == "adamw":
+        matrix_params = [param for _, param, _ in muon_params]
+        param_groups.extend(
+            [
+                _adamw_group("matrix", matrix_params, config.matrix_lr, config.weight_decay),
+                _adamw_group("scalar_vector", scalar_params, config.scalar_lr, 0.0),
+            ]
+        )
+        return MuonAdamW(param_groups, excluded=excluded)
+
+    param_groups.append(_adamw_group("scalar_vector", scalar_params, config.scalar_lr, 0.0))
     group_keys = sorted({(tuple(param.shape), split_sizes) for _, param, split_sizes in muon_params}, key=str)
     for shape, split_sizes in group_keys:
         shape_params = [param for _, param, param_split_sizes in muon_params if tuple(param.shape) == shape and param_split_sizes == split_sizes]

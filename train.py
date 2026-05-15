@@ -428,6 +428,8 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
     if args.rope_backend is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.rope_backend = model_cfg.get("rope_backend")
+    if args.optimizer is None:
+        args.optimizer = cfg.get("optimizer")
     if args.seed is None:
         args.seed = manifest.get("seed")
     if getattr(args, "data_shuffle_seed", None) is None:
@@ -511,6 +513,7 @@ def main() -> None:
     parser.add_argument("--loss-backend", choices=["torch", "triton"])
     parser.add_argument("--loss-chunk-size", type=int, help="token rows per linear CE chunk; use 0 for the built-in heuristic")
     parser.add_argument("--rope-backend", choices=["torch", "triton"])
+    parser.add_argument("--optimizer", choices=["muon_adamw", "adamw"])
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-mode", default=DEFAULTS["compile_mode"], choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     parser.add_argument("--no-compile-capture-scalar-outputs", action="store_true")
@@ -545,6 +548,7 @@ def main() -> None:
     if args.loss_chunk_size < 0:
         parser.error("--loss-chunk-size must be >= 0")
     args.rope_backend = args.rope_backend if args.rope_backend is not None else DEFAULTS["rope_backend"]
+    args.optimizer = args.optimizer if args.optimizer is not None else DEFAULTS["optimizer"]
     if args.depth is None and args.target_params is None:
         parser.error("--depth is required unless --target-params is provided or --match-run fills it")
 
@@ -583,6 +587,7 @@ def main() -> None:
         loss_backend=args.loss_backend,
         loss_chunk_size=args.loss_chunk_size,
         rope_backend=args.rope_backend,
+        optimizer=args.optimizer,
         comparison_mode=args.comparison_mode,
     )
     if ddp["enabled"]:
@@ -759,6 +764,7 @@ def main() -> None:
                     "unembedding_lr": config.unembedding_lr * lr_mult,
                     "matrix_lr": config.matrix_lr * lr_mult,
                     "scalar_lr": config.scalar_lr * lr_mult,
+                    "optimizer": config.optimizer,
                     "muon_momentum": optimizer.muon_momentum,
                     "weight_decay": config.weight_decay,
                     "grad_norm": float(grad_norm),

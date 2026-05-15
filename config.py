@@ -25,6 +25,7 @@ DEFAULTS = {
     "matrix_lr_ref": 0.02,
     "scalar_lr_ref": 0.1,
     "weight_decay": 0.1,
+    "optimizer": "muon_adamw",
     "lr_scheduler": "wsd",
     "warmup_ratio": 0.05,
     "warmdown_ratio": 0.3,
@@ -233,6 +234,7 @@ class ResolvedConfig:
     matrix_lr: float
     scalar_lr: float
     weight_decay: float
+    optimizer: str
     warmup_ratio: float
     warmup_steps: int
     warmdown_ratio: float
@@ -292,6 +294,7 @@ def resolve_config(
     loss_backend: str = DEFAULTS["loss_backend"],
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"],
     rope_backend: str = DEFAULTS["rope_backend"],
+    optimizer: str = DEFAULTS["optimizer"],
     comparison_mode: str = "same_depth",
 ) -> ResolvedConfig:
     if comparison_mode not in COMPARISON_MODES:
@@ -310,6 +313,8 @@ def resolve_config(
         raise ValueError(f"loss_chunk_size must be nonnegative, got {loss_chunk_size}")
     if rope_backend not in {"torch", "triton"}:
         raise ValueError(f"unknown RoPE backend {rope_backend!r}")
+    if optimizer not in {"muon_adamw", "adamw"}:
+        raise ValueError(f"unknown optimizer {optimizer!r}")
     budget_overrides = [num_iterations, target_tokens, target_bytes, target_flops, target_time_seconds]
     if sum(value is not None for value in budget_overrides) > 1:
         raise ValueError("choose only one budget override: num_iterations, target_tokens, target_bytes, target_flops, or target_time_seconds")
@@ -416,6 +421,7 @@ def resolve_config(
         matrix_lr=matrix_lr,
         scalar_lr=scalar_lr,
         weight_decay=weight_decay,
+        optimizer=optimizer,
         lr_scheduler=DEFAULTS["lr_scheduler"],
         warmup_ratio=DEFAULTS["warmup_ratio"],
         warmup_steps=warmup_steps,
@@ -461,6 +467,7 @@ def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
     data.pop("predicted_batch_tokens", None)
     data.pop("dmodel_lr_scale", None)
     data.setdefault("lr_scheduler", DEFAULTS["lr_scheduler"])
+    data.setdefault("optimizer", DEFAULTS["optimizer"])
     data.setdefault("total_gradient_accumulation_steps", data["gradient_accumulation_steps"])
     data.setdefault("world_size", 1)
     model_data = dict(data["model"])

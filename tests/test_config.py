@@ -35,6 +35,7 @@ def test_config_derivation() -> None:
     assert DEFAULTS["mlp_backend"] == "triton"
     assert DEFAULTS["loss_backend"] == "triton"
     assert DEFAULTS["rope_backend"] == "triton"
+    assert DEFAULTS["optimizer"] == "muon_adamw"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
@@ -77,6 +78,8 @@ def test_config_derivation() -> None:
     assert custom_loss_chunk.model.loss_chunk_size == 8192
     heuristic_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=0)
     assert heuristic_loss_chunk.model.loss_chunk_size == 0
+    adamw = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, optimizer="adamw")
+    assert adamw.optimizer == "adamw"
 
 
 def test_config_shape_and_budget_controls() -> None:
