@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import math
 
-from config import DEFAULTS, auto_device_batch_size, config_from_dict, depth_dimensions, layer_attention_window, resolve_config, scaling_params_for_depth
+from config import (
+    DEFAULTS,
+    auto_device_batch_size,
+    config_from_dict,
+    depth_dimensions,
+    estimate_activation_gib_per_sample,
+    layer_attention_window,
+    mlp_hidden_dim,
+    resolve_config,
+    scaling_params_for_depth,
+)
 
 
 def test_config_derivation() -> None:
@@ -20,6 +30,7 @@ def test_config_derivation() -> None:
     assert DEFAULTS["sequence_len"] == 2048
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
+    assert DEFAULTS["global_batch_tokens"] == 2**20
     assert DEFAULTS["lr_depth_stability_reference"] == 6
     assert DEFAULTS["mlp_backend"] == "triton"
     assert DEFAULTS["loss_backend"] == "triton"
@@ -99,39 +110,64 @@ def test_config_shape_and_budget_controls() -> None:
         raise AssertionError("unknown mlp_backend should fail")
 
 
-def test_auto_device_batch_size_l40_shapes() -> None:
+def test_auto_device_batch_size_uses_memory_cap() -> None:
     actual = {}
     for depth in (6, 12, 18, 24):
         n_embd, _ = depth_dimensions(depth)
-        actual[depth] = auto_device_batch_size(depth, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0)
-    assert actual == {6: 64, 12: 32, 18: 16, 24: 8}
+        actual[depth] = auto_device_batch_size(depth, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0, vocab_size=32768)
+    # Memory cap alone determines the microbatch size; global batch policy is separate.
+    assert actual == {6: 128, 12: 32, 18: 16, 24: 8}
 
 
-def test_depth_lr_scale_cap_l40_defaults() -> None:
+def test_activation_memory_estimate_uses_model_dimensions() -> None:
+    depth = 12
+    n_embd, _ = depth_dimensions(depth)
+    hidden = mlp_hidden_dim(n_embd)
+    expected = (
+        1.20
+        * 2
+        * depth
+        * DEFAULTS["sequence_len"]
+        * (10 * n_embd + 3 * hidden)
+        / 1024**3
+    )
+    assert math.isclose(estimate_activation_gib_per_sample(depth, n_embd, DEFAULTS["sequence_len"]), expected)
+
+
+def test_depth_lr_scale_cap_fixed_global_batch_defaults() -> None:
     cfg6 = resolve_config(depth=6, vocab_size=32768, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
     cfg12 = resolve_config(depth=12, vocab_size=32768, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
     cfg24 = resolve_config(depth=24, vocab_size=32768, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
 
-    assert math.isclose(cfg6.extra["uncapped_batch_lr_scale"], math.sqrt(393216 / DEFAULTS["reference_batch_tokens"]))
+    assert cfg6.global_batch_tokens == DEFAULTS["global_batch_tokens"]
+    assert cfg12.global_batch_tokens == DEFAULTS["global_batch_tokens"]
+    assert cfg24.global_batch_tokens == DEFAULTS["global_batch_tokens"]
+
+    assert math.isclose(cfg6.extra["uncapped_batch_lr_scale"], 1.0)
     assert math.isclose(cfg6.extra["depth_lr_cap"], 1.0)
     assert math.isclose(cfg6.batch_lr_scale, cfg6.extra["uncapped_batch_lr_scale"])
     assert math.isclose(cfg6.matrix_lr, DEFAULTS["matrix_lr_ref"] * cfg6.batch_lr_scale)
 
+    assert math.isclose(cfg12.extra["uncapped_batch_lr_scale"], 1.0)
     assert cfg12.extra["uncapped_batch_lr_scale"] > cfg12.extra["depth_lr_cap"]
     assert math.isclose(cfg12.batch_lr_scale, math.sqrt(DEFAULTS["lr_depth_stability_reference"] / 12))
     assert math.isclose(cfg12.matrix_lr, DEFAULTS["matrix_lr_ref"] * cfg12.batch_lr_scale)
 
-    assert cfg24.global_batch_tokens == 753664
+    assert math.isclose(cfg24.extra["uncapped_batch_lr_scale"], 1.0)
     assert cfg24.extra["uncapped_batch_lr_scale"] > cfg24.extra["depth_lr_cap"]
     assert math.isclose(cfg24.batch_lr_scale, 0.5)
     assert math.isclose(cfg24.matrix_lr, 0.01)
     assert cfg24.extra["lr_depth_stability_reference"] == DEFAULTS["lr_depth_stability_reference"]
 
+    custom = resolve_config(depth=12, vocab_size=32768, global_batch_tokens=2**21, gpu_memory_gib=48.0, precision="fp32_test", compile_model=False)
+    assert custom.requested_global_batch_tokens == 2**21
+    assert custom.global_batch_tokens == 2**21
+
 
 def test_auto_device_batch_size_scales_with_gpu_memory() -> None:
     n_embd, _ = depth_dimensions(12)
-    small = auto_device_batch_size(12, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=12.0)
-    large = auto_device_batch_size(12, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0)
+    small = auto_device_batch_size(12, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=12.0, vocab_size=32768)
+    large = auto_device_batch_size(12, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0, vocab_size=32768)
     assert small < large
 
 

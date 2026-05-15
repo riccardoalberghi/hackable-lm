@@ -18,8 +18,7 @@ DEFAULTS = {
     "device_batch_size": 16,
     "auto_device_batch_memory_fraction": 0.68,
     "auto_device_batch_max": 128,
-    "reference_depth": 12,
-    "reference_batch_tokens": 2**19,
+    "global_batch_tokens": 2**20,
     "lr_depth_stability_reference": 6,
     "embedding_lr_ref": 0.1,
     "unembedding_lr_ref": 0.01,
@@ -39,6 +38,10 @@ DEFAULTS = {
 }
 
 L40_BF16_DENSE_PEAK = 181e12
+BF16_BYTES = 2
+ACTIVATION_MEMORY_SAFETY = 1.20
+ACTIVATION_EMBD_STREAMS = 10
+ACTIVATION_MLP_STREAMS = 3
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -61,28 +64,62 @@ def depth_dimensions(depth: int, head_dim: int = DEFAULTS["head_dim"], layers_pe
     return n_embd, n_head
 
 
+def estimate_activation_gib_per_sample(depth: int, n_embd: int, sequence_len: int) -> float:
+    hidden = mlp_hidden_dim(n_embd)
+    # FlashAttention keeps attention memory linear in sequence length; the safety
+    # multiplier covers compiler workspaces, temporaries, and allocator effects.
+    activation_elements_per_token_layer = (
+        ACTIVATION_EMBD_STREAMS * n_embd
+        + ACTIVATION_MLP_STREAMS * hidden
+    )
+    return (
+        ACTIVATION_MEMORY_SAFETY
+        * BF16_BYTES
+        * depth
+        * sequence_len
+        * activation_elements_per_token_layer
+        / 1024**3
+    )
+
+
 def auto_device_batch_size(
     depth: int,
     n_embd: int,
     sequence_len: int,
     gpu_memory_gib: float | None = None,
     *,
+    vocab_size: int,
     max_batch_size: int = DEFAULTS["auto_device_batch_max"],
     memory_fraction: float = DEFAULTS["auto_device_batch_memory_fraction"],
 ) -> int:
-    shape_cap = min(max_batch_size, _pow2_floor(384 / depth))
-
     if gpu_memory_gib is None:
-        return max(1, min(DEFAULTS["device_batch_size"], shape_cap))
+        return DEFAULTS["device_batch_size"]
 
-    gib_per_depth_width_seq_sample = 4.0e-8
-    budget_gib = max(1.0, gpu_memory_gib * memory_fraction)
-    estimated_batch = budget_gib / (
-        gib_per_depth_width_seq_sample * depth * n_embd * sequence_len
+    # Memory consumed by non-activation tensors (parameters, gradients, optimizer states)
+    # must be subtracted from the budget before allocating for activations.
+    # Conservative estimate: all params use AdamW = 8 bytes/param
+    # (2 param + 2 grad + 2 exp_avg + 2 exp_avg_sq, all BF16).
+    # This overestimates Muon params (6 bytes/param), giving a small safety margin.
+    total_params = (
+        scaling_params_for_depth(depth, vocab_size)
+        + vocab_size * n_embd           # embedding table (not in scaling_params)
     )
+    static_gib = total_params * 8 / 1024**3
+
+    # Fixed overhead: CUDA context, compilation cache, pinned buffers, fragmentation.
+    cuda_overhead_gib = 2.0
+
+    budget_gib = max(1.0, gpu_memory_gib * memory_fraction)
+    available_gib = max(0.0, budget_gib - static_gib - cuda_overhead_gib)
+
+    per_sample_gib = estimate_activation_gib_per_sample(depth, n_embd, sequence_len)
+    if per_sample_gib <= 0:
+        return max(1, min(max_batch_size, 1))
+
+    estimated_batch = available_gib / per_sample_gib
     memory_cap = _pow2_floor(estimated_batch)
 
-    return max(1, min(shape_cap, memory_cap))
+    return max(1, min(max_batch_size, memory_cap))
 
 
 def mlp_hidden_dim(n_embd: int) -> int:
@@ -184,9 +221,6 @@ class ResolvedConfig:
     sequence_len: int
     scaling_params: int
     target_tokens: int
-    reference_depth: int
-    reference_batch_tokens: int
-    predicted_batch_tokens: int
     global_batch_tokens: int
     requested_global_batch_tokens: int | None
     device_batch_size: int
@@ -297,6 +331,7 @@ def resolve_config(
             n_embd,
             sequence_len,
             gpu_memory_gib,
+            vocab_size=vocab_size,
         )
     hidden = mlp_hidden_dim(n_embd)
     scaling_params = scaling_params_for_depth(depth, vocab_size)
@@ -317,15 +352,15 @@ def resolve_config(
     elif num_iterations is not None:
         budget_policy = "fixed_steps"
 
-    batch_depth_scale = math.sqrt(depth / DEFAULTS["reference_depth"])
-    predicted_batch_tokens = max(1, round(DEFAULTS["reference_batch_tokens"] * batch_depth_scale))
+    if global_batch_tokens is not None and global_batch_tokens <= 0:
+        raise ValueError(f"global_batch_tokens must be positive, got {global_batch_tokens}")
     requested_global = global_batch_tokens
-    nominal_global = global_batch_tokens or predicted_batch_tokens
+    nominal_global = global_batch_tokens if global_batch_tokens is not None else DEFAULTS["global_batch_tokens"]
     micro_tokens = device_batch_size * sequence_len
     grad_accum = max(1, ceil_div(nominal_global, micro_tokens))
     actual_global = grad_accum * micro_tokens
 
-    batch_lr_scale = math.sqrt(actual_global / DEFAULTS["reference_batch_tokens"])
+    batch_lr_scale = math.sqrt(actual_global / DEFAULTS["global_batch_tokens"])
     depth_lr_cap = math.sqrt(DEFAULTS["lr_depth_stability_reference"] / depth)
     lr_scale = min(batch_lr_scale, depth_lr_cap)
     embedding_lr = DEFAULTS["embedding_lr_ref"] * lr_scale
@@ -369,9 +404,6 @@ def resolve_config(
         sequence_len=sequence_len,
         scaling_params=scaling_params,
         target_tokens=resolved_target_tokens,
-        reference_depth=DEFAULTS["reference_depth"],
-        reference_batch_tokens=DEFAULTS["reference_batch_tokens"],
-        predicted_batch_tokens=predicted_batch_tokens,
         global_batch_tokens=actual_global,
         requested_global_batch_tokens=requested_global,
         device_batch_size=device_batch_size,
@@ -422,14 +454,12 @@ def resolve_config(
 
 def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
     data = dict(obj)
-    old_ref_depth = data.pop("D_REF", None)
-    old_ref_batch = data.pop("B_REF", None)
+    data.pop("D_REF", None)
+    data.pop("B_REF", None)
+    data.pop("reference_depth", None)
+    data.pop("reference_batch_tokens", None)
+    data.pop("predicted_batch_tokens", None)
     data.pop("dmodel_lr_scale", None)
-    data.setdefault(
-        "reference_depth",
-        old_ref_depth if isinstance(old_ref_depth, int) and old_ref_depth < 10_000 else DEFAULTS["reference_depth"],
-    )
-    data.setdefault("reference_batch_tokens", old_ref_batch or DEFAULTS["reference_batch_tokens"])
     data.setdefault("lr_scheduler", DEFAULTS["lr_scheduler"])
     data.setdefault("total_gradient_accumulation_steps", data["gradient_accumulation_steps"])
     data.setdefault("world_size", 1)
