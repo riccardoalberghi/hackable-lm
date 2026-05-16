@@ -44,8 +44,8 @@ def deterministic_subset(examples: list[dict[str, Any]], limit: int | None, seed
 
 @torch.no_grad()
 def continuation_logprob(model, tokenizer, context: str, continuation: str, device: torch.device) -> tuple[float, int]:
-    prefix = tokenizer.encode(context).ids
-    full = tokenizer.encode(context + continuation).ids
+    prefix = tokenizer.encode(context)
+    full = tokenizer.encode(context + continuation)
     if len(full) <= len(prefix):
         return 0.0, 0
     if len(full) < 2:
@@ -233,8 +233,8 @@ def evaluate_lambada(model, tokenizer, examples: list[dict[str, Any]], device: t
         nll -= score
         ntok += count
         # Exact-token prediction for the first target token is the classic LAMBADA-style fast signal.
-        prefix_ids = tokenizer.encode(context).ids
-        target_ids = tokenizer.encode(context + target).ids[len(prefix_ids) :]
+        prefix_ids = tokenizer.encode(context)
+        target_ids = tokenizer.encode(context + target)[len(prefix_ids) :]
         if prefix_ids and target_ids:
             idx = torch.tensor(prefix_ids, dtype=torch.long, device=device)[None, :]
             logits, _ = model(idx)

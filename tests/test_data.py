@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from conftest import requires_torch, torch
-from tokenizer import BOS_TOKEN, TOKENIZER_BACKEND, load_tokenizer
+from tokenizer import BOS_TOKEN, TOKENIZER_BACKEND, tokenizer_impl_hash, load_tokenizer
 
 
 @requires_torch
@@ -28,6 +28,8 @@ def test_preprocess_and_memmap(tmp_path: Path) -> None:
     assert manifest["train_text_bytes"] > 0
     assert manifest["val_text_bytes"] > 0
     assert manifest["tokenizer_backend"] == TOKENIZER_BACKEND
+    assert manifest["tokenizer_format"] == "hackablebpe"
+    assert manifest["tokenizer_impl_hash"] == tokenizer_impl_hash()
     assert manifest["min_frequency"] == 1
     capacity_loader = MemmapDataLoader(out, block_size=8, data_shuffle_seed=123)
     available = capacity_loader.available_spans("train")

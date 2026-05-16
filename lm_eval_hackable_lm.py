@@ -89,7 +89,7 @@ class SimpleLMHarness(LM):
         return self._device
 
     def tok_encode(self, string: str, **_: Any) -> list[int]:
-        return self.tokenizer.encode(string).ids
+        return self.tokenizer.encode(string)
 
     def tok_decode(self, tokens: list[int], **_: Any) -> str:
         return self.tokenizer.decode(tokens)

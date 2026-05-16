@@ -32,10 +32,9 @@ RAW_FILE="${RAW_FILE:-data/raw/fineweb_${FINEWEB_CONFIG}_${FINEWEB_DOCS}.jsonl}"
 EVAL_DATA="${EVAL_DATA:-eval_data}"
 TASKS="${TASKS:-hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq,validation_loss}"
 EVAL_LIMIT_PER_TASK="${EVAL_LIMIT_PER_TASK:-128}"
-EXPECTED_TOKENIZER_BACKEND="hackable_lm_rustbpe_bytelevel"
 
 export RAW_FILE FINEWEB_DOCS FINEWEB_DATASET FINEWEB_CONFIG FINEWEB_SPLIT
-export DATA_DIR VOCAB_SIZE MIN_FREQUENCY PREPARE_BATCH_SIZE JSONL_TEXT_FIELD VAL_FRACTION EXPECTED_TOKENIZER_BACKEND
+export DATA_DIR VOCAB_SIZE MIN_FREQUENCY PREPARE_BATCH_SIZE JSONL_TEXT_FIELD VAL_FRACTION
 
 if ! command -v uv >/dev/null 2>&1; then
   python3 -m venv .venv
@@ -43,14 +42,13 @@ if ! command -v uv >/dev/null 2>&1; then
   python -m pip install --upgrade pip uv
 fi
 
-# Ensure rustup-installed toolchains are visible to make setup/uv builds.
-export PATH="$HOME/.cargo/bin:$PATH"
 make setup
 
 uv run python - <<'PY'
-from tokenizer import TOKENIZER_BACKEND
+from tokenizer import TOKENIZER_BACKEND, TOKENIZER_FORMAT
 
 print(f"Tokenizer backend: {TOKENIZER_BACKEND}")
+print(f"Tokenizer format: {TOKENIZER_FORMAT}")
 PY
 
 mkdir -p "$(dirname "$RAW_FILE")"
@@ -156,6 +154,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from tokenizer import TOKENIZER_BACKEND, TOKENIZER_FORMAT, tokenizer_impl_hash
 
 manifest_path = Path(os.environ["DATA_DIR"]) / "manifest.json"
 if not manifest_path.is_file():
@@ -164,7 +163,9 @@ if not manifest_path.is_file():
 
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 expected = {
-    "tokenizer_backend": os.environ["EXPECTED_TOKENIZER_BACKEND"],
+    "tokenizer_backend": TOKENIZER_BACKEND,
+    "tokenizer_format": TOKENIZER_FORMAT,
+    "tokenizer_impl_hash": tokenizer_impl_hash(),
     "requested_vocab_size": int(os.environ["VOCAB_SIZE"]),
     "min_frequency": int(os.environ["MIN_FREQUENCY"]),
     "tokenize_batch_size": int(os.environ["PREPARE_BATCH_SIZE"]),

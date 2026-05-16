@@ -591,7 +591,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "datasets", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "hackable-lm-rustbpe", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "lm-eval", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "mlflow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -608,7 +607,6 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = ">=4.8.5" },
     { name = "flash-attn", specifier = "==2.8.3" },
-    { name = "hackable-lm-rustbpe", directory = "rustbpe" },
     { name = "lm-eval", specifier = ">=0.4.11" },
     { name = "mlflow", specifier = ">=3.11.1" },
     { name = "numpy", specifier = ">=2.4.4" },
@@ -618,11 +616,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.3" }]
-
-[[package]]
-name = "hackable-lm-rustbpe"
-version = "0.1.0"
-source = { directory = "rustbpe" }
 
 [[package]]
 name = "hf-xet"

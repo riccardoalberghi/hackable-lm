@@ -3,7 +3,10 @@ __pycache__/
 _hackable_lm_tokenizer*.so
 _hackable_lm_tokenizer*.pyd
 _hackable_lm_tokenizer*.dylib
-rustbpe/target/
+_hackablebpe*.so
+_hackablebpe*.pyd
+_hackablebpe*.dylib
+hackablebpe/target/
 
 .DS_Store
 .venv/

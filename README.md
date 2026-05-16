@@ -27,7 +27,7 @@ MFU* is usually in the high 50s to low 60s, reported against the standard bf16 p
 
 ## What Is Here
 
-- byte-level BPE tokenizer with a local Rust backend
+- `hackablebpe` Rust byte-level BPE tokenizer trainer, encoder, and decoder
 - document-offset token memmap preprocessing
 - decoder-only causal LM in `model.py`
 - RoPE, RMSNorm, QK norm, SwiGLU MLPs, fused QKV and fused gate/up projections
@@ -50,9 +50,9 @@ manually, install `uv` first. The FineWeb script below can bootstrap it.
 make setup
 ```
 
-This syncs the `uv` environment and builds the local Rust tokenizer extension.
-You need a CUDA-capable PyTorch environment, FlashAttention 2, and a Rust
-toolchain. CPU paths exist for tests only, not for real training.
+This builds the local Rust tokenizer trainer and Python extension, then syncs the `uv` environment.
+You need a Rust toolchain, a CUDA-capable PyTorch environment, and
+FlashAttention 2. CPU paths exist for tests only, not for real training.
 
 ## Run Training
 

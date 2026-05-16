@@ -231,7 +231,9 @@ BASE_COMPARISON_FIELDS = [
     ("seed", "seed"),
     ("data.data_shuffle_seed", "data shuffle seed"),
     ("data.manifest.tokenizer_backend", "tokenizer backend"),
+    ("data.manifest.tokenizer_format", "tokenizer format"),
     ("data.manifest.tokenizer_hash", "tokenizer hash"),
+    ("data.manifest.tokenizer_impl_hash", "tokenizer implementation hash"),
     ("data.manifest.raw_input_sha256", "data hashes"),
     ("data.manifest.split_seed", "train/val split seed"),
 ]

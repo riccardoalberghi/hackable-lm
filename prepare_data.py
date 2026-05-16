@@ -97,12 +97,11 @@ def encode_and_write_splits(
         tqdm = None
     progress = tqdm(desc="Tokenizing corpus", unit="docs") if tqdm is not None else None
     for texts in batched(iter_texts(input_paths, jsonl_text_field), batch_size):
-        encodings = tok.encode_batch(texts)
+        encoded_texts = tok.encode_batch(texts)
         pending_ids = {"train": [], "val": []}
         pending_lengths: dict[str, list[int]] = {"train": [], "val": []}
         pending_text_bytes: dict[str, list[int]] = {"train": [], "val": []}
-        for text, encoding in zip(texts, encodings):
-            ids = encoding.ids
+        for text, ids in zip(texts, encoded_texts):
             ids.append(eos_id)
             text_bytes = len(text.encode("utf-8"))
             split = "val" if rng.random() < val_fraction else "train"
@@ -175,8 +174,10 @@ def prepare_all(
         "raw_input_file_sizes": {str(p): p.stat().st_size for p in input_paths},
         "raw_input_sha256": {str(p): hash_file(p) for p in input_paths},
         "tokenizer_hash": tok_info["tokenizer_hash"],
+        "tokenizer_impl_hash": tok_info["tokenizer_impl_hash"],
         "tokenizer_path": str(tokenizer_path),
         "tokenizer_backend": tok_info["backend"],
+        "tokenizer_format": tok_info["format"],
         "vocab_size": tok_info["vocab_size"],
         "requested_vocab_size": vocab_size,
         "min_frequency": min_frequency,
@@ -191,7 +192,6 @@ def prepare_all(
         "dtype": dtype_name,
         "jsonl_text_field": jsonl_text_field,
         "tokenize_batch_size": batch_size,
-        "prepare_data_code_hash": hash_file(Path(__file__)),
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return manifest
