@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from config import COMPARISON_MODES, DEFAULTS, L40_BF16_DENSE_PEAK, resolve_config
+from config import COMPARISON_MODES, DEFAULTS, resolve_config
 from data import MemmapDataLoader, load_manifest
 from kernels import apply_precision_policy, compile_training_model, mark_compiled_step_begin, resolve_kernel_backends
 from model import LanguageModel
@@ -158,7 +158,7 @@ def _log_mlflow_params(mlflow, values: dict[str, Any], prefix: str = "") -> None
 
 def _log_mlflow_metrics(mlflow, record: dict[str, Any], *, step: int, prefix: str = "train") -> None:
     metrics = {}
-    skipped = {"step", "run_id", "precision", "kernel_backends", "seed", "data_hash"}
+    skipped = {"step", "run_id", "precision", "kernel_backends", "seed", "data_hash", "peak_flops"}
     for key, value in record.items():
         if key in skipped or isinstance(value, bool):
             continue
@@ -186,7 +186,6 @@ def format_train_record(record: dict[str, Any], total_steps: int) -> str:
     loss = float(record["loss"])
     tokens_seen = int(record["tokens_seen"])
     tokens_sec = float(record["tokens_sec"])
-    mfu = float(record["mfu"])
     lr_mult = float(record["lr_multiplier"])
     grad_norm = float(record["grad_norm"])
     eta = format_duration((total_steps - step - 1) * tokens_seen / (step + 1) / tokens_sec) if tokens_sec > 0 else "?"
@@ -196,9 +195,11 @@ def format_train_record(record: dict[str, Any], total_steps: int) -> str:
         f"lr {lr_mult:5.3f}",
         f"gn {grad_norm:6.3f}",
         f"{tokens_sec / 1000:>4.0f}k tok/s",
-        f"mfu {mfu * 100:5.1f}%",
-        f"eta {eta:>7}",
     ]
+    if "mfu" in record:
+        mfu = float(record["mfu"])
+        parts.append(f"mfu {mfu * 100:5.1f}%")
+    parts.append(f"eta {eta:>7}")
     if "val_loss" in record:
         parts.append(f"val {float(record['val_loss']):7.4f}")
     if "val_bpb" in record:
@@ -496,6 +497,7 @@ def main() -> None:
     parser.add_argument("--target-flops", type=float)
     parser.add_argument("--target-seconds", type=float)
     parser.add_argument("--tokens-per-second", type=float)
+    parser.add_argument("--peak-flops", type=float, help="peak bf16 FLOP/s of the GPU (e.g. 181e12 for L40); sets the MFU denominator. If omitted, MFU is not logged.")
     parser.add_argument("--comparison-mode", default="same_depth", choices=sorted(COMPARISON_MODES))
     parser.add_argument("--match-run")
     parser.add_argument("--candidate-label")
@@ -549,6 +551,8 @@ def main() -> None:
         parser.error("--loss-chunk-size must be >= 0")
     args.rope_backend = args.rope_backend if args.rope_backend is not None else DEFAULTS["rope_backend"]
     args.optimizer = args.optimizer if args.optimizer is not None else DEFAULTS["optimizer"]
+    if args.peak_flops is not None and args.peak_flops <= 0:
+        parser.error("--peak-flops must be > 0")
     if args.depth is None and args.target_params is None:
         parser.error("--depth is required unless --target-params is provided or --match-run fills it")
 
@@ -655,6 +659,7 @@ def main() -> None:
             kernel_info=kernel_info,
             label=args.candidate_label,
             max_grad_norm=args.max_grad_norm,
+            peak_flops=args.peak_flops,
         )
     if ddp["enabled"]:
         manifest_box = [manifest]
@@ -771,8 +776,6 @@ def main() -> None:
                     "tokens_seen": tokens_seen,
                     "tokens_sec": tokens_sec,
                     "model_flops_sec": model_flops_sec,
-                    "mfu": model_flops_sec / L40_BF16_DENSE_PEAK if model_flops_sec else 0.0,
-                    "bf16_mfu": model_flops_sec / L40_BF16_DENSE_PEAK if model_flops_sec else 0.0,
                     "peak_memory": torch.cuda.max_memory_allocated(),
                     "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3,
                     "reserved_memory": torch.cuda.max_memory_reserved(),
@@ -785,6 +788,9 @@ def main() -> None:
                     "data_hash": data_manifest["tokenizer_hash"],
                     "overfit_first_batch": args.overfit_first_batch,
                 }
+                if args.peak_flops is not None:
+                    record["mfu"] = model_flops_sec / args.peak_flops if model_flops_sec else 0.0
+                    record["peak_flops"] = args.peak_flops
                 if timing_record is not None:
                     record["timing"] = timing_record
                 if step % args.val_interval == 0 and step != start_step:

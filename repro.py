@@ -161,6 +161,7 @@ def write_run_manifest(
     kernel_info: dict[str, Any],
     label: str | None = None,
     max_grad_norm: float = 0.0,
+    peak_flops: float | None = None,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +206,7 @@ def write_run_manifest(
             "final_lr_frac": config.final_lr_frac,
         },
         "token_budget": config.target_tokens,
+        "peak_flops": peak_flops,
         "data": data_info,
         "tokenizer": tokenizer_info,
         "environment": collect_environment(Path.cwd()),
