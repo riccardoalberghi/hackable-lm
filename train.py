@@ -207,103 +207,6 @@ def format_train_record(record: dict[str, Any], total_steps: int) -> str:
     return " | ".join(parts)
 
 
-TIMING_PHASES = (
-    "zero_grad",
-    "data_wait",
-    "forward_backward",
-    "prefetch",
-    "grad_norm",
-    "lr_update",
-    "optimizer",
-)
-
-
-class CudaStepTimer:
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.phase_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {phase: [] for phase in TIMING_PHASES}
-        self.phase_cpu_ms: dict[str, float] = {phase: 0.0 for phase in TIMING_PHASES}
-        self.step_start = torch.cuda.Event(enable_timing=True)
-        self.step_end = torch.cuda.Event(enable_timing=True)
-        self.wall_start = 0.0
-
-    def start_step(self) -> None:
-        self.wall_start = time.perf_counter()
-        self.step_start.record(torch.cuda.current_stream(self.device))
-
-    @contextlib.contextmanager
-    def measure(self, phase: str):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        stream = torch.cuda.current_stream(self.device)
-        start.record(stream)
-        cpu_start = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.phase_cpu_ms[phase] = self.phase_cpu_ms.get(phase, 0.0) + (time.perf_counter() - cpu_start) * 1000.0
-            end.record(stream)
-            self.phase_events.setdefault(phase, []).append((start, end))
-
-    def finish(self, step: int) -> dict[str, Any]:
-        self.step_end.record(torch.cuda.current_stream(self.device))
-        self.step_end.synchronize()
-        wall_ms = (time.perf_counter() - self.wall_start) * 1000.0
-        total_ms = self.step_start.elapsed_time(self.step_end)
-        phase_ms = {
-            phase: sum(start.elapsed_time(end) for start, end in events)
-            for phase, events in self.phase_events.items()
-        }
-        accounted_ms = sum(phase_ms.values())
-        return {
-            "step": step,
-            "total_ms": total_ms,
-            "wall_ms": wall_ms,
-            "phase_ms": phase_ms,
-            "phase_cpu_ms": dict(self.phase_cpu_ms),
-            "unaccounted_ms": max(0.0, total_ms - accounted_ms),
-        }
-
-
-@contextlib.contextmanager
-def timed_phase(timer: CudaStepTimer | None, phase: str):
-    if timer is None:
-        yield
-    else:
-        with timer.measure(phase):
-            yield
-
-
-def should_time_step(step: int, args) -> bool:
-    return args.timing_interval > 0 and step >= args.timing_warmup and step % args.timing_interval == 0
-
-
-def format_timing_record(timing: dict[str, Any]) -> str:
-    total_ms = float(timing["total_ms"])
-    phases = timing["phase_ms"]
-
-    def phase(label: str, name: str) -> str:
-        ms = float(phases.get(name, 0.0))
-        pct = 100.0 * ms / total_ms if total_ms > 0 else 0.0
-        return f"{label} {ms:6.1f}ms {pct:4.1f}%"
-
-    other_ms = float(timing.get("unaccounted_ms", 0.0))
-    other_pct = 100.0 * other_ms / total_ms if total_ms > 0 else 0.0
-    parts = [
-        f"timing step {int(timing['step']):>5}",
-        f"total {total_ms:7.1f}ms",
-        phase("zero", "zero_grad"),
-        phase("data", "data_wait"),
-        phase("fb", "forward_backward"),
-        phase("pref", "prefetch"),
-        phase("norm", "grad_norm"),
-        phase("lr", "lr_update"),
-        phase("opt", "optimizer"),
-        f"other {other_ms:6.1f}ms {other_pct:4.1f}%",
-    ]
-    return " | ".join(parts)
-
-
 def training_data_info(loader: MemmapDataLoader, *, overfit_first_batch: bool) -> dict[str, Any]:
     info = loader.info()
     info["overfit_first_batch"] = overfit_first_batch
@@ -504,8 +407,6 @@ def main() -> None:
     parser.add_argument("--resume")
     parser.add_argument("--allow-resume-mismatch", action="store_true", help="resume even if checkpoint provenance differs from requested run settings")
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--timing-interval", type=int, default=0, help="log CUDA event phase timing every N optimizer steps; set 0 to disable")
-    parser.add_argument("--timing-warmup", type=int, default=5, help="skip this many optimizer steps before timing")
     parser.add_argument("--val-interval", type=int, default=100)
     parser.add_argument("--val-batches", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
@@ -530,10 +431,6 @@ def main() -> None:
         help="debug sanity check: repeatedly train on the first sampled training batch",
     )
     args = parser.parse_args()
-    if args.timing_interval < 0:
-        parser.error("--timing-interval must be >= 0")
-    if args.timing_warmup < 0:
-        parser.error("--timing-warmup must be >= 0")
 
     matched_manifest = load_run_manifest_arg(args.match_run) if args.match_run else None
     if matched_manifest:
@@ -690,7 +587,6 @@ def main() -> None:
     train_prefetcher = loader.cuda_prefetcher("train", config.device_batch_size, device)
     fixed_train_batch = train_prefetcher.next(prepare_next=False) if args.overfit_first_batch else None
     train_log = (run_dir / "train_log.jsonl").open("a", encoding="utf-8") if is_main else None
-    timing_log = (run_dir / "timing_log.jsonl").open("a", encoding="utf-8") if is_main and args.timing_interval > 0 else None
     torch.cuda.reset_peak_memory_stats()
     train_start_time = time.perf_counter()
     last_time = time.perf_counter()
@@ -700,12 +596,8 @@ def main() -> None:
     try:
         for step in range(start_step, config.num_iterations):
             log_this_step = is_main and (step % args.log_interval == 0 or step == config.num_iterations - 1)
-            timer = CudaStepTimer(device) if is_main and should_time_step(step, args) else None
-            if timer is not None:
-                timer.start_step()
             mark_compiled_step_begin(config.compile)
-            with timed_phase(timer, "zero_grad"):
-                optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             total_loss = None
             for micro_step in range(config.gradient_accumulation_steps):
                 should_sync = micro_step == config.gradient_accumulation_steps - 1
@@ -716,42 +608,20 @@ def main() -> None:
                 )
                 with sync_context:
                     more_train_batches = step != config.num_iterations - 1 or micro_step != config.gradient_accumulation_steps - 1
-                    with timed_phase(timer, "data_wait"):
-                        x, y = next_train_batch(train_prefetcher, fixed_train_batch, prepare_next=more_train_batches)
-                    with timed_phase(timer, "forward_backward"):
-                        _, loss = model(x, y)
-                        (loss / config.gradient_accumulation_steps).backward()
+                    x, y = next_train_batch(train_prefetcher, fixed_train_batch, prepare_next=more_train_batches)
+                    _, loss = model(x, y)
+                    (loss / config.gradient_accumulation_steps).backward()
                     if log_this_step:
                         detached_loss = loss.detach().clone()
                         total_loss = detached_loss if total_loss is None else total_loss + detached_loss
-            with timed_phase(timer, "grad_norm"):
-                if args.max_grad_norm > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, args.max_grad_norm, foreach=True)
-                elif log_this_step:
-                    grad_norm = grad_global_norm(clip_params)
-            with timed_phase(timer, "lr_update"):
-                lr_mult = lr_multiplier(step, config.num_iterations, config.warmup_steps, config.warmdown_ratio, config.final_lr_frac, config.lr_scheduler)
-                optimizer.set_lr_multiplier(lr_mult)
-            with timed_phase(timer, "optimizer"):
-                optimizer.step()
-            timing_record = timer.finish(step) if timer is not None else None
+            if args.max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, args.max_grad_norm, foreach=True)
+            elif log_this_step:
+                grad_norm = grad_global_norm(clip_params)
+            lr_mult = lr_multiplier(step, config.num_iterations, config.warmup_steps, config.warmdown_ratio, config.final_lr_frac, config.lr_scheduler)
+            optimizer.set_lr_multiplier(lr_mult)
+            optimizer.step()
             tokens_seen += config.global_batch_tokens
-
-            if timing_record is not None:
-                print(format_timing_record(timing_record), flush=True)
-                if timing_log is not None:
-                    timing_log.write(json.dumps(timing_record) + "\n")
-                    timing_log.flush()
-                if mlflow is not None:
-                    _log_mlflow_metrics(
-                        mlflow,
-                        {
-                            "timing_total_ms": timing_record["total_ms"],
-                            "timing_unaccounted_ms": timing_record["unaccounted_ms"],
-                            **{f"timing_{name}_ms": value for name, value in timing_record["phase_ms"].items()},
-                        },
-                        step=step,
-                    )
 
             if log_this_step:
                 now = time.perf_counter()
@@ -791,8 +661,6 @@ def main() -> None:
                 if args.peak_flops is not None:
                     record["mfu"] = model_flops_sec / args.peak_flops if model_flops_sec else 0.0
                     record["peak_flops"] = args.peak_flops
-                if timing_record is not None:
-                    record["timing"] = timing_record
                 if step % args.val_interval == 0 and step != start_step:
                     record["val_loss"] = validate(raw_model, loader, config, device, args.val_batches)
                     val_bpb = estimate_bits_per_byte(record["val_loss"], data_manifest)
@@ -848,15 +716,11 @@ def main() -> None:
                 }
             )
             mlflow.log_artifact(str(run_dir / "train_log.jsonl"))
-            if timing_log is not None:
-                mlflow.log_artifact(str(run_dir / "timing_log.jsonl"))
             mlflow.log_artifact(str(run_dir / "final.json"))
             mlflow.log_artifact(str(run_dir / "checkpoints" / "latest.pt"), artifact_path="checkpoints")
     finally:
         if train_log is not None:
             train_log.close()
-        if timing_log is not None:
-            timing_log.close()
         if mlflow is not None:
             mlflow.end_run()
         cleanup_ddp(ddp)
