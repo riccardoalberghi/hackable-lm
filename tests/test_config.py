@@ -118,8 +118,37 @@ def test_auto_device_batch_size_uses_memory_cap() -> None:
     for depth in (6, 12, 18, 24):
         n_embd, _ = depth_dimensions(depth)
         actual[depth] = auto_device_batch_size(depth, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=48.0, vocab_size=32768)
-    # Memory cap alone determines the microbatch size; global batch policy is separate.
+    # On L40S-class memory, the memory cap still determines these model sizes.
     assert actual == {6: 128, 12: 32, 18: 16, 24: 8}
+
+
+def test_auto_device_batch_size_respects_global_batch_fairness_cap() -> None:
+    n_embd, _ = depth_dimensions(2)
+    default_fair_cap = DEFAULTS["global_batch_tokens"] // DEFAULTS["sequence_len"]
+    assert default_fair_cap > 128
+    assert auto_device_batch_size(2, n_embd, DEFAULTS["sequence_len"], gpu_memory_gib=141.0, vocab_size=32768) == default_fair_cap
+
+    small_global = 2**18
+    small_fair_cap = small_global // DEFAULTS["sequence_len"]
+    assert auto_device_batch_size(
+        2,
+        n_embd,
+        DEFAULTS["sequence_len"],
+        gpu_memory_gib=141.0,
+        vocab_size=32768,
+        global_batch_tokens=small_global,
+    ) == small_fair_cap
+
+    cfg = resolve_config(
+        depth=2,
+        vocab_size=32768,
+        global_batch_tokens=small_global,
+        gpu_memory_gib=141.0,
+        precision="fp32_test",
+        compile_model=False,
+    )
+    assert cfg.device_batch_size == small_fair_cap
+    assert cfg.extra["auto_device_batch_fairness_cap"] == small_fair_cap
 
 
 def test_activation_memory_estimate_uses_model_dimensions() -> None:

@@ -164,16 +164,35 @@ if triton is not None:
     _LINEAR_CE_MAX_BLOCK_SIZE = 32768
     _LINEAR_CE_MIN_CHUNK_SIZE = 2048
     _SWIGLU_MAX_BLOCK_SIZE = 8192
-    _SWIGLU_CONFIGS = [
+    _SWIGLU_BASE_CONFIGS = [
         triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
         for block_m in (1, 2, 4)
         for num_warps in (4, 8, 16)
         for num_stages in (3, 4)
     ]
-    _LINEAR_CE_CONFIGS = [
+    _SWIGLU_HOPPER_CONFIGS = [
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
+        for block_m in (8,)
+        for num_warps in (8, 16, 32)
+        for num_stages in (3, 4, 5)
+    ]
+    _SWIGLU_CONFIGS = [
+        *_SWIGLU_BASE_CONFIGS,
+        *_SWIGLU_HOPPER_CONFIGS,
+    ]
+    _LINEAR_CE_BASE_CONFIGS = [
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in (2, 4, 8, 16, 32)
         for num_stages in (3, 4, 5)
+    ]
+    _LINEAR_CE_HOPPER_CONFIGS = [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in (8, 16, 32)
+        for num_stages in (6, 7)
+    ]
+    _LINEAR_CE_CONFIGS = [
+        *_LINEAR_CE_BASE_CONFIGS,
+        *_LINEAR_CE_HOPPER_CONFIGS,
     ]
 
     # Autotune replays the kernel; this kernel overwrites logits with gradients.
@@ -313,13 +332,23 @@ if triton is not None:
         return grad_gate_up
 
 
-    _QK_NORM_ROPE_CONFIGS = [
+    _QK_NORM_ROPE_BASE_CONFIGS = [
         triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
         for block_m in (1, 2, 4, 8, 16)
         for num_warps in (1, 2, 4, 8)
         for num_stages in (3, 4)
         if not (block_m == 1 and num_warps == 8)
         if not (block_m >= 8 and num_warps == 1)
+    ]
+    _QK_NORM_ROPE_HOPPER_CONFIGS = [
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps, num_stages=num_stages)
+        for block_m in (32,)
+        for num_warps in (4, 8, 16)
+        for num_stages in (3, 4, 5)
+    ]
+    _QK_NORM_ROPE_CONFIGS = [
+        *_QK_NORM_ROPE_BASE_CONFIGS,
+        *_QK_NORM_ROPE_HOPPER_CONFIGS,
     ]
 
     @triton.autotune(

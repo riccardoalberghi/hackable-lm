@@ -16,8 +16,7 @@ DEFAULTS = {
     "attention_full_every": 4,
     "target_param_data_ratio": 60,
     "device_batch_size": 16,
-    "auto_device_batch_memory_fraction": 0.68,
-    "auto_device_batch_max": 128,
+    "auto_device_batch_memory_fraction": 0.85,
     "global_batch_tokens": 2**20,
     "lr_depth_stability_reference": 6,
     "embedding_lr_ref": 0.1,
@@ -89,11 +88,12 @@ def auto_device_batch_size(
     gpu_memory_gib: float | None = None,
     *,
     vocab_size: int,
-    max_batch_size: int = DEFAULTS["auto_device_batch_max"],
+    global_batch_tokens: int = DEFAULTS["global_batch_tokens"],
     memory_fraction: float = DEFAULTS["auto_device_batch_memory_fraction"],
 ) -> int:
+    fair_batch_cap = max(1, global_batch_tokens // sequence_len)
     if gpu_memory_gib is None:
-        return DEFAULTS["device_batch_size"]
+        return min(DEFAULTS["device_batch_size"], fair_batch_cap)
 
     # Memory consumed by non-activation tensors (parameters, gradients, optimizer states)
     # must be subtracted from the budget before allocating for activations.
@@ -114,12 +114,12 @@ def auto_device_batch_size(
 
     per_sample_gib = estimate_activation_gib_per_sample(depth, n_embd, sequence_len)
     if per_sample_gib <= 0:
-        return max(1, min(max_batch_size, 1))
+        return 1
 
     estimated_batch = available_gib / per_sample_gib
     memory_cap = _pow2_floor(estimated_batch)
 
-    return max(1, min(max_batch_size, memory_cap))
+    return max(1, min(fair_batch_cap, memory_cap))
 
 
 def mlp_hidden_dim(n_embd: int) -> int:
@@ -327,6 +327,11 @@ def resolve_config(
     else:
         shape_policy = "depth"
 
+    if global_batch_tokens is not None and global_batch_tokens <= 0:
+        raise ValueError(f"global_batch_tokens must be positive, got {global_batch_tokens}")
+    requested_global = global_batch_tokens
+    nominal_global = global_batch_tokens if global_batch_tokens is not None else DEFAULTS["global_batch_tokens"]
+
     n_embd, n_head = depth_dimensions(depth)
     requested_device_batch_size = device_batch_size
     if device_batch_size is None or device_batch_size <= 0:
@@ -336,6 +341,7 @@ def resolve_config(
             sequence_len,
             gpu_memory_gib,
             vocab_size=vocab_size,
+            global_batch_tokens=nominal_global,
         )
     hidden = mlp_hidden_dim(n_embd)
     scaling_params = scaling_params_for_depth(depth, vocab_size)
@@ -356,10 +362,6 @@ def resolve_config(
     elif num_iterations is not None:
         budget_policy = "fixed_steps"
 
-    if global_batch_tokens is not None and global_batch_tokens <= 0:
-        raise ValueError(f"global_batch_tokens must be positive, got {global_batch_tokens}")
-    requested_global = global_batch_tokens
-    nominal_global = global_batch_tokens if global_batch_tokens is not None else DEFAULTS["global_batch_tokens"]
     micro_tokens = device_batch_size * sequence_len
     grad_accum = max(1, ceil_div(nominal_global, micro_tokens))
     actual_global = grad_accum * micro_tokens
@@ -450,6 +452,7 @@ def resolve_config(
             "requested_device_batch_size": requested_device_batch_size,
             "gpu_memory_gib": gpu_memory_gib,
             "auto_device_batch_memory_fraction": DEFAULTS["auto_device_batch_memory_fraction"],
+            "auto_device_batch_fairness_cap": max(1, nominal_global // sequence_len),
             "uncapped_batch_lr_scale": batch_lr_scale,
             "depth_lr_cap": depth_lr_cap,
             "lr_depth_stability_reference": DEFAULTS["lr_depth_stability_reference"],
