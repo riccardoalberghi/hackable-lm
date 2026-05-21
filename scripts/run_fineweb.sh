@@ -17,8 +17,37 @@ case "$DEPTH" in
     ;;
 esac
 
-RUN_NAME="${RUN_NAME:-d${DEPTH}_fineweb_tpp20}"
-FINEWEB_DATASET="${FINEWEB_DATASET:-HuggingFaceFW/fineweb}"
+FINEWEB_VARIANT="${FINEWEB_VARIANT:-edu}"
+case "$FINEWEB_VARIANT" in
+  edu|fineweb-edu|fineweb_edu)
+    DEFAULT_FINEWEB_DATASET="HuggingFaceFW/fineweb-edu"
+    ;;
+  web|fineweb)
+    DEFAULT_FINEWEB_DATASET="HuggingFaceFW/fineweb"
+    ;;
+  *)
+    echo "Unknown FINEWEB_VARIANT=$FINEWEB_VARIANT; expected edu or web." >&2
+    exit 2
+    ;;
+esac
+
+FINEWEB_DATASET="${FINEWEB_DATASET:-$DEFAULT_FINEWEB_DATASET}"
+if [[ -z "${FINEWEB_DATASET_SLUG:-}" ]]; then
+  case "$FINEWEB_DATASET" in
+    HuggingFaceFW/fineweb-edu)
+      FINEWEB_DATASET_SLUG="fineweb_edu"
+      ;;
+    HuggingFaceFW/fineweb)
+      FINEWEB_DATASET_SLUG="fineweb"
+      ;;
+    *)
+      FINEWEB_DATASET_SLUG="${FINEWEB_DATASET##*/}"
+      FINEWEB_DATASET_SLUG="${FINEWEB_DATASET_SLUG//[^[:alnum:]_]/_}"
+      ;;
+  esac
+fi
+
+RUN_NAME="${RUN_NAME:-d${DEPTH}_${FINEWEB_DATASET_SLUG}_tpp20}"
 FINEWEB_CONFIG="${FINEWEB_CONFIG:-sample-10BT}"
 FINEWEB_SPLIT="${FINEWEB_SPLIT:-train}"
 FINEWEB_DOCS="${FINEWEB_DOCS:-$DEFAULT_FINEWEB_DOCS}"
@@ -27,15 +56,15 @@ MIN_FREQUENCY="${MIN_FREQUENCY:-2}"
 PREPARE_BATCH_SIZE="${PREPARE_BATCH_SIZE:-2048}"
 JSONL_TEXT_FIELD="${JSONL_TEXT_FIELD:-text}"
 VAL_FRACTION="${VAL_FRACTION:-0.0909090909}"
-DATA_DIR="${DATA_DIR:-data/processed/fineweb_${FINEWEB_CONFIG}_${FINEWEB_DOCS}_d${DEPTH}}"
-RAW_FILE="${RAW_FILE:-data/raw/fineweb_${FINEWEB_CONFIG}_${FINEWEB_DOCS}.jsonl}"
+DATA_DIR="${DATA_DIR:-data/processed/${FINEWEB_DATASET_SLUG}_${FINEWEB_CONFIG}_${FINEWEB_DOCS}_d${DEPTH}}"
+RAW_FILE="${RAW_FILE:-data/raw/${FINEWEB_DATASET_SLUG}_${FINEWEB_CONFIG}_${FINEWEB_DOCS}.jsonl}"
 LM_EVAL_SUITE="${LM_EVAL_SUITE:-standard}"
 LM_EVAL_TASKS="${LM_EVAL_TASKS:-}"
 LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT:-}"
 LM_EVAL_LIMIT="${LM_EVAL_LIMIT:-}"
 LM_EVAL_OUTPUT="${LM_EVAL_OUTPUT:-runs/$RUN_NAME/eval/lm_eval_results.json}"
 
-export RAW_FILE FINEWEB_DOCS FINEWEB_DATASET FINEWEB_CONFIG FINEWEB_SPLIT
+export RAW_FILE FINEWEB_DOCS FINEWEB_VARIANT FINEWEB_DATASET FINEWEB_DATASET_SLUG FINEWEB_CONFIG FINEWEB_SPLIT
 export DATA_DIR VOCAB_SIZE MIN_FREQUENCY PREPARE_BATCH_SIZE JSONL_TEXT_FIELD VAL_FRACTION
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -66,7 +95,7 @@ limit = int(os.environ["FINEWEB_DOCS"])
 if not path.is_file() or path.stat().st_size == 0:
     sys.exit(1)
 if limit <= 0:
-    print(f"Using existing FineWeb file {path}")
+    print(f"Using existing {os.environ['FINEWEB_DATASET']} file {path}")
     sys.exit(0)
 
 count = 0
@@ -75,9 +104,13 @@ with path.open("rb") as f:
         if count >= limit:
             break
 if count >= limit:
-    print(f"Using existing FineWeb file {path} with at least {limit} documents")
+    print(f"Using existing {os.environ['FINEWEB_DATASET']} file {path} with at least {limit} documents")
     sys.exit(0)
-print(f"Existing FineWeb file {path} has {count} documents; expected {limit}. Re-downloading.", file=sys.stderr)
+print(
+    f"Existing {os.environ['FINEWEB_DATASET']} file {path} has {count} documents; expected {limit}. "
+    "Re-downloading.",
+    file=sys.stderr,
+)
 sys.exit(1)
 PY
   then
@@ -105,7 +138,7 @@ ds = load_dataset(
     streaming=True,
 )
 n = 0
-progress = tqdm(total=limit if limit > 0 else None, unit="docs", desc="Downloading FineWeb")
+progress = tqdm(total=limit if limit > 0 else None, unit="docs", desc=f"Downloading {os.environ['FINEWEB_DATASET']}")
 with open(tmp, "w", encoding="utf-8") as f:
     for row in ds:
         if limit > 0 and n >= limit:
@@ -143,7 +176,7 @@ with path.open("rb") as f:
 sys.exit(0 if count >= limit else 1)
 PY
     then
-      echo "FineWeb download process exited nonzero after completing $RAW_FILE; continuing with the completed file."
+      echo "$FINEWEB_DATASET download process exited nonzero after completing $RAW_FILE; continuing with the completed file."
     else
       exit 1
     fi
@@ -228,7 +261,7 @@ uv run python train.py \
   --target-param-data-ratio 20 \
   --data "$DATA_DIR" \
   --run-name "$RUN_NAME" \
-  --mlflow-experiment "fineweb-d${DEPTH}-validation"
+  --mlflow-experiment "${FINEWEB_DATASET_SLUG}-d${DEPTH}-validation"
 
 lm_eval_args=(
   --checkpoint "runs/$RUN_NAME/checkpoints/latest.pt"
