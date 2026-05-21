@@ -110,6 +110,8 @@ def test_prepare_all_uses_rust_tokenizer_without_torch(tmp_path: Path) -> None:
     assert (out / "tokenizer.json").exists()
     assert (out / "train.bin").exists()
     assert (out / "val.bin").exists()
+    assert (out / "train.jsonl").exists()
+    assert (out / "val.jsonl").exists()
     assert (out / "train_offsets.npy").exists()
     assert (out / "val_offsets.npy").exists()
     assert manifest["tokenizer_backend"] == TOKENIZER_BACKEND
@@ -119,3 +121,46 @@ def test_prepare_all_uses_rust_tokenizer_without_torch(tmp_path: Path) -> None:
     assert manifest["vocab_size"] <= 300
     assert manifest["train_tokens"] > 0
     assert manifest["val_tokens"] > 0
+    assert manifest["split_raw_paths"] == {
+        "train": str(out / "train.jsonl"),
+        "val": str(out / "val.jsonl"),
+    }
+    assert manifest["split_raw_documents"]["train"] > 0
+    assert manifest["split_raw_documents"]["val"] > 0
+
+
+def test_prepare_all_trains_tokenizer_on_train_split_only(tmp_path: Path) -> None:
+    from prepare_data import prepare_all
+
+    train_text = "ab" * 20
+    val_text = "z" * 200
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text(
+        "\n".join(
+            [
+                json.dumps({"text": train_text}),
+                json.dumps({"text": val_text}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "processed"
+    manifest = prepare_all(
+        [str(raw)],
+        out,
+        vocab_size=len(SPECIAL_TOKENS) + 257,
+        val_fraction=0.5,
+        split_seed=0,
+        min_frequency=1,
+    )
+
+    payload = json.loads((out / "tokenizer.json").read_text(encoding="utf-8"))
+    z_id = len(SPECIAL_TOKENS) + ord("z")
+    assert all((merge["left"], merge["right"]) != (z_id, z_id) for merge in payload["merges"])
+    assert manifest["tokenizer_training_split"] == "train"
+    assert manifest["tokenizer_training_documents"] == 1
+    assert manifest["tokenizer_training_text_bytes"] == len(train_text.encode("utf-8"))
+    assert manifest["train_text_bytes"] == len(train_text.encode("utf-8"))
+    assert manifest["val_text_bytes"] == len(val_text.encode("utf-8"))
+    assert (out / "train.jsonl").read_text(encoding="utf-8") == json.dumps({"text": train_text}) + "\n"
+    assert (out / "val.jsonl").read_text(encoding="utf-8") == json.dumps({"text": val_text}) + "\n"

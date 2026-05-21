@@ -166,6 +166,7 @@ expected = {
     "tokenizer_backend": TOKENIZER_BACKEND,
     "tokenizer_format": TOKENIZER_FORMAT,
     "tokenizer_impl_hash": tokenizer_impl_hash(),
+    "tokenizer_training_split": "train",
     "requested_vocab_size": int(os.environ["VOCAB_SIZE"]),
     "min_frequency": int(os.environ["MIN_FREQUENCY"]),
     "tokenize_batch_size": int(os.environ["PREPARE_BATCH_SIZE"]),
@@ -190,7 +191,15 @@ val_fraction = float(os.environ["VAL_FRACTION"])
 if not math.isclose(float(manifest.get("val_fraction", -1.0)), val_fraction, rel_tol=0.0, abs_tol=1e-12):
     mismatches.append(f"val_fraction: expected {val_fraction!r}, found {manifest.get('val_fraction')!r}")
 
-for name in ("tokenizer.json", "train.bin", "val.bin", "train_offsets.npy", "val_offsets.npy"):
+for name in (
+    "tokenizer.json",
+    "train.jsonl",
+    "val.jsonl",
+    "train.bin",
+    "val.bin",
+    "train_offsets.npy",
+    "val_offsets.npy",
+):
     if not (manifest_path.parent / name).is_file():
         mismatches.append(f"missing {name}")
 
@@ -201,7 +210,7 @@ if mismatches:
     sys.exit(1)
 PY
 then
-  echo "Preparing data in $DATA_DIR with tokenizer training over the full input."
+  echo "Preparing data in $DATA_DIR with tokenizer training over the train split only."
   uv run python prepare_data.py all \
     --input "$RAW_FILE" \
     --vocab-size "$VOCAB_SIZE" \

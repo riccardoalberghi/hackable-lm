@@ -13,7 +13,6 @@ from repro import hash_file
 from tokenizer import (
     EOS_TOKEN,
     SPECIAL_TOKENS,
-    TOKENIZER_BACKEND,
     iter_texts,
     load_tokenizer,
     tokenizer_manifest,
@@ -62,14 +61,54 @@ def split_stats(offsets: array, doc_text_bytes: array) -> dict[str, int]:
     }
 
 
-def encode_and_write_splits(
+def _split_raw_corpus(
     input_paths: list[Path],
+    output_dir: Path,
+    jsonl_text_field: str,
+    val_fraction: float,
+    split_seed: int,
+) -> tuple[dict[str, Path], dict[str, dict[str, int]]]:
+    rng = np.random.default_rng(split_seed)
+    split_paths = {
+        "train": output_dir / "train.jsonl",
+        "val": output_dir / "val.jsonl",
+    }
+    stats = {
+        "train": {"documents": 0, "text_bytes": 0},
+        "val": {"documents": 0, "text_bytes": 0},
+    }
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        tqdm = None
+    progress = tqdm(desc="Splitting raw corpus", unit="docs") if tqdm is not None else None
+    with (
+        split_paths["train"].open("w", encoding="utf-8") as train_fh,
+        split_paths["val"].open("w", encoding="utf-8") as val_fh,
+    ):
+        handles = {"train": train_fh, "val": val_fh}
+        for text in iter_texts(input_paths, jsonl_text_field):
+            split = "val" if rng.random() < val_fraction else "train"
+            handles[split].write(json.dumps({jsonl_text_field: text}, ensure_ascii=False) + "\n")
+            stats[split]["documents"] += 1
+            stats[split]["text_bytes"] += len(text.encode("utf-8"))
+            if progress is not None:
+                progress.update(1)
+    if progress is not None:
+        progress.close()
+    if stats["train"]["documents"] == 0 and stats["val"]["documents"] == 0:
+        raise RuntimeError("no documents were found in the input data")
+    if stats["train"]["documents"] == 0 or stats["val"]["documents"] == 0:
+        raise RuntimeError("document split produced an empty train or validation split")
+    return split_paths, stats
+
+
+def encode_and_write_splits(
+    split_input_paths: dict[str, Path],
     tokenizer_path: Path,
     output: Path,
     vocab_size: int,
     jsonl_text_field: str,
-    val_fraction: float,
-    split_seed: int,
     batch_size: int,
 ) -> dict[str, int]:
     tok = load_tokenizer(tokenizer_path)
@@ -88,37 +127,34 @@ def encode_and_write_splits(
         path.unlink(missing_ok=True)
     train_path.touch()
     val_path.touch()
-    rng = np.random.default_rng(split_seed)
     offsets = {"train": array("Q", [0]), "val": array("Q", [0])}
     doc_text_bytes = {"train": array("Q"), "val": array("Q")}
     try:
         from tqdm.auto import tqdm
     except ImportError:
         tqdm = None
-    progress = tqdm(desc="Tokenizing corpus", unit="docs") if tqdm is not None else None
-    for texts in batched(iter_texts(input_paths, jsonl_text_field), batch_size):
-        encoded_texts = tok.encode_batch(texts)
-        pending_ids = {"train": [], "val": []}
-        pending_lengths: dict[str, list[int]] = {"train": [], "val": []}
-        pending_text_bytes: dict[str, list[int]] = {"train": [], "val": []}
-        for text, ids in zip(texts, encoded_texts):
-            ids.append(eos_id)
-            text_bytes = len(text.encode("utf-8"))
-            split = "val" if rng.random() < val_fraction else "train"
-            pending_ids[split].extend(ids)
-            pending_lengths[split].append(len(ids))
-            pending_text_bytes[split].append(text_bytes)
-        for split, path in (("train", train_path), ("val", val_path)):
-            if not pending_ids[split]:
+    for split, path in (("train", train_path), ("val", val_path)):
+        progress = tqdm(desc=f"Tokenizing {split} corpus", unit="docs") if tqdm is not None else None
+        for texts in batched(iter_texts([split_input_paths[split]], jsonl_text_field), batch_size):
+            encoded_texts = tok.encode_batch(texts)
+            pending_ids: list[int] = []
+            pending_lengths: list[int] = []
+            pending_text_bytes: list[int] = []
+            for text, ids in zip(texts, encoded_texts):
+                ids.append(eos_id)
+                pending_ids.extend(ids)
+                pending_lengths.append(len(ids))
+                pending_text_bytes.append(len(text.encode("utf-8")))
+            if not pending_ids:
                 continue
-            append_ids(path, pending_ids[split], dtype)
-            for length, text_bytes in zip(pending_lengths[split], pending_text_bytes[split]):
+            append_ids(path, pending_ids, dtype)
+            for length, text_bytes in zip(pending_lengths, pending_text_bytes):
                 offsets[split].append(offsets[split][-1] + length)
                 doc_text_bytes[split].append(text_bytes)
+            if progress is not None:
+                progress.update(len(texts))
         if progress is not None:
-            progress.update(len(texts))
-    if progress is not None:
-        progress.close()
+            progress.close()
     if len(offsets["train"]) == 1 and len(offsets["val"]) == 1:
         raise RuntimeError("no documents were found in the input data")
     if len(offsets["train"]) == 1 or len(offsets["val"]) == 1:
@@ -149,8 +185,15 @@ def prepare_all(
     output.mkdir(parents=True, exist_ok=True)
     input_paths = expand_inputs(input_patterns)
     tokenizer_path = output / "tokenizer.json"
-    train_tokenizer(
+    split_input_paths, split_text_stats = _split_raw_corpus(
         input_paths,
+        output,
+        jsonl_text_field,
+        val_fraction,
+        split_seed,
+    )
+    train_tokenizer(
+        [split_input_paths["train"]],
         tokenizer_path,
         vocab_size,
         jsonl_text_field,
@@ -159,13 +202,11 @@ def prepare_all(
     dtype = np.uint16 if vocab_size <= 65535 else np.uint32
     dtype_name = "uint16" if dtype == np.uint16 else "uint32"
     split_stats = encode_and_write_splits(
-        input_paths,
+        split_input_paths,
         tokenizer_path,
         output,
         vocab_size,
         jsonl_text_field,
-        val_fraction,
-        split_seed,
         batch_size,
     )
     tok_info = tokenizer_manifest(tokenizer_path)
@@ -173,11 +214,17 @@ def prepare_all(
         "raw_input_paths": [str(p) for p in input_paths],
         "raw_input_file_sizes": {str(p): p.stat().st_size for p in input_paths},
         "raw_input_sha256": {str(p): hash_file(p) for p in input_paths},
+        "split_raw_paths": {split: str(path) for split, path in split_input_paths.items()},
+        "split_raw_file_sizes": {split: path.stat().st_size for split, path in split_input_paths.items()},
+        "split_raw_documents": {split: split_text_stats[split]["documents"] for split in ("train", "val")},
         "tokenizer_hash": tok_info["tokenizer_hash"],
         "tokenizer_impl_hash": tok_info["tokenizer_impl_hash"],
         "tokenizer_path": str(tokenizer_path),
         "tokenizer_backend": tok_info["backend"],
         "tokenizer_format": tok_info["format"],
+        "tokenizer_training_split": "train",
+        "tokenizer_training_documents": split_text_stats["train"]["documents"],
+        "tokenizer_training_text_bytes": split_text_stats["train"]["text_bytes"],
         "vocab_size": tok_info["vocab_size"],
         "requested_vocab_size": vocab_size,
         "min_frequency": min_frequency,
