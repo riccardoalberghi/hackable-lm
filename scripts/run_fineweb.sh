@@ -29,9 +29,11 @@ JSONL_TEXT_FIELD="${JSONL_TEXT_FIELD:-text}"
 VAL_FRACTION="${VAL_FRACTION:-0.0909090909}"
 DATA_DIR="${DATA_DIR:-data/processed/fineweb_${FINEWEB_CONFIG}_${FINEWEB_DOCS}_d${DEPTH}}"
 RAW_FILE="${RAW_FILE:-data/raw/fineweb_${FINEWEB_CONFIG}_${FINEWEB_DOCS}.jsonl}"
-EVAL_DATA="${EVAL_DATA:-eval_data}"
-TASKS="${TASKS:-hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq,validation_loss}"
-EVAL_LIMIT_PER_TASK="${EVAL_LIMIT_PER_TASK:-128}"
+LM_EVAL_SUITE="${LM_EVAL_SUITE:-standard}"
+LM_EVAL_TASKS="${LM_EVAL_TASKS:-}"
+LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT:-}"
+LM_EVAL_LIMIT="${LM_EVAL_LIMIT:-}"
+LM_EVAL_OUTPUT="${LM_EVAL_OUTPUT:-runs/$RUN_NAME/eval/lm_eval_results.json}"
 
 export RAW_FILE FINEWEB_DOCS FINEWEB_DATASET FINEWEB_CONFIG FINEWEB_SPLIT
 export DATA_DIR VOCAB_SIZE MIN_FREQUENCY PREPARE_BATCH_SIZE JSONL_TEXT_FIELD VAL_FRACTION
@@ -228,16 +230,23 @@ uv run python train.py \
   --run-name "$RUN_NAME" \
   --mlflow-experiment "fineweb-d${DEPTH}-validation"
 
-uv run python prepare_eval.py \
-  --source hf \
-  --output "$EVAL_DATA" \
-  --limit-per-task "$EVAL_LIMIT_PER_TASK"
+lm_eval_args=(
+  --checkpoint "runs/$RUN_NAME/checkpoints/latest.pt"
+  --tokenizer "$DATA_DIR/tokenizer.json"
+  --output "$LM_EVAL_OUTPUT"
+)
+if [[ -n "$LM_EVAL_TASKS" ]]; then
+  lm_eval_args+=(--tasks "$LM_EVAL_TASKS")
+  if [[ -n "$LM_EVAL_NUM_FEWSHOT" ]]; then
+    lm_eval_args+=(--num-fewshot "$LM_EVAL_NUM_FEWSHOT")
+  fi
+else
+  lm_eval_args+=(--suite "$LM_EVAL_SUITE")
+fi
+if [[ -n "$LM_EVAL_LIMIT" ]]; then
+  lm_eval_args+=(--limit "$LM_EVAL_LIMIT")
+fi
 
-uv run python eval.py \
-  --checkpoint "runs/$RUN_NAME/checkpoints/latest.pt" \
-  --data "$DATA_DIR" \
-  --eval-data "$EVAL_DATA" \
-  --tasks "$TASKS" \
-  --limit-per-task "$EVAL_LIMIT_PER_TASK"
+uv run python run_lm_eval.py "${lm_eval_args[@]}"
 
 echo "MLflow: uv run mlflow ui --backend-store-uri file://$(pwd)/runs/mlruns"

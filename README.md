@@ -35,7 +35,7 @@ MFU* is usually in the high 50s to low 60s, reported against the standard bf16 p
 - Muon for transformer matrices and AdamW for embeddings, head, and small params
 - strict CUDA training path in `train.py`
 - run manifests for comparing one change at a time
-- local eval code plus an EleutherAI `lm-eval` adapter
+- EleutherAI `lm-eval` adapter for benchmark evaluation
 
 The shape of the code matters. Architecture changes should mostly live in
 `model.py`, optimizer changes in `optim.py`, data sampling in `data.py`, and
@@ -57,8 +57,8 @@ FlashAttention 2. CPU paths exist for tests only, not for real training.
 ## Run Training
 
 The built-in FineWeb script downloads data, trains a tokenizer, prepares token
-memmaps, trains the model, prepares local eval data, runs the eval pass, and
-prints the MLflow command at the end.
+memmaps, trains the model, runs the standard `lm-eval` pass, and prints the
+MLflow command at the end.
 
 ```bash
 scripts/run_fineweb.sh 12
@@ -133,26 +133,22 @@ or `same_time` for efficiency claims.
 
 ## Eval
 
-Quick local eval:
-
-```bash
-uv run python prepare_eval.py --source hf --output eval_data
-
-uv run python eval.py \
-  --checkpoint runs/d12/checkpoints/latest.pt \
-  --data data/processed \
-  --eval-data eval_data \
-  --tasks validation_loss,hellaswag,piqa,arc_easy,arc_challenge,openbookqa,winogrande,boolq
-```
-
-Harness eval:
-
 ```bash
 uv run python run_lm_eval.py \
   --checkpoint runs/d12/checkpoints/latest.pt \
   --tokenizer data/processed/tokenizer.json \
   --output runs/d12/eval/lm_eval_results.json
 ```
+
+The default `standard` suite runs:
+
+- 0-shot commonsense: HellaSwag, PIQA, ARC-Easy, ARC-Challenge, WinoGrande, OpenBookQA, BoolQ
+- 0-shot LAMBADA: `lambada_openai`
+- 5-shot MMLU: `mmlu`
+
+Use `--suite commonsense`, `--suite lambada`, or `--suite mmlu` to run one
+group. Use `--tasks task_a,task_b --num-fewshot N` for an intentional custom
+run. By default there is no sample limit; pass `--limit` only for smoke checks.
 
 ## Tests
 

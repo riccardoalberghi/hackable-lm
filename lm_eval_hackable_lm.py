@@ -94,9 +94,17 @@ class SimpleLMHarness(LM):
     def tok_decode(self, tokens: list[int], **_: Any) -> str:
         return self.tokenizer.decode(tokens)
 
-    def _encode_pair(self, context: str, continuation: str) -> _Scored:
+    def tok_encode_pair(self, context: str, continuation: str) -> tuple[list[int], list[int]]:
+        trailing_spaces = len(context) - len(context.rstrip())
+        if trailing_spaces:
+            continuation = context[-trailing_spaces:] + continuation
+            context = context[:-trailing_spaces]
         context_enc = self.tok_encode(context)
-        continuation_enc = self.tok_encode(continuation)
+        whole_enc = self.tok_encode(context + continuation)
+        return context_enc, whole_enc[len(context_enc) :]
+
+    def _encode_pair(self, context: str, continuation: str) -> _Scored:
+        context_enc, continuation_enc = self.tok_encode_pair(context, continuation)
         if not context_enc:
             context_enc = [self.eot_token_id]
         tokens = context_enc + continuation_enc
