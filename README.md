@@ -58,7 +58,8 @@ FlashAttention 2. CPU paths exist for tests only, not for real training.
 
 The built-in FineWeb script downloads data, trains a tokenizer, prepares token
 memmaps, trains the model, runs the standard `lm-eval` pass, and prints the
-MLflow command at the end.
+MLflow command at the end. Its default edu source is
+`HuggingFaceTB/smollm-corpus` with config `fineweb-edu-dedup`.
 
 ```bash
 scripts/run_fineweb.sh 12

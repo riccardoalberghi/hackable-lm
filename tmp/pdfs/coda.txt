@@ -1,0 +1,2591 @@
+CODA: Rewriting Transformer Blocks as
+GEMM-Epilogue Programs
+
+Han Guo1∗ Jack Zhang2
+1
+
+Vijay Thakkar4
+
+Massachusetts Institute of Technology
+
+2
+
+Yoon Kim1
+
+Princeton University
+
+Tri Dao2,3
+3
+
+Together AI
+
+4
+
+Meta
+
+hanguo@mit.edu
+
+Abstract
+Transformer training systems are built around dense linear algebra, yet a nontrivial fraction of end-to-end time is spent on surrounding memory-bound operators.
+Normalization, activations, residual updates, reductions, and related computations
+repeatedly move large intermediate tensors through global memory while performing little arithmetic, making data movement an increasingly important bottleneck
+in otherwise highly optimized training stacks. We introduce CODA, a GPU kernel
+abstraction that expresses these computations as GEMM-plus-epilogue programs.
+CODA is based on the observation that many Transformer operators exposed as
+separate framework kernels can be algebraically reparameterized to execute while
+a GEMM output tile remains on chip, before it is written to memory. The abstraction fixes the GEMM mainloop and exposes a small set of composable epilogue
+primitives for scaling, reductions, pairwise transformations, and accumulation.
+This constrained interface preserves the performance structure of expert-written
+GEMMs while remaining expressive enough to cover nearly all non-attention
+computation in the forward and backward pass of a standard Transformer block.
+Across representative Transformer workloads, both human- and LLM-authored
+CODA kernels achieve high performance, suggesting that GEMM-plus-epilogue programming offers a practical path toward combining framework-level productivity
+with hardware-level efficiency.2
+
+1
+
+Introduction
+
+100
+
+Others
+
+Others
+LLM training has become just as much of a systems prob80
+Optimizer
+lem as a modeling one. FLOPs in modern Transformerbased LLMs are dominated by matrix multiplications and atOptimizer
+60
+Attention
+tention, whose kernels have been heavily optimized for TenAttention
+sor Core execution. Yet Transformers, and deep learning
+40
+architectures more broadly, also contain normalization, activations, residual updates, reductions, and other bandwidthGEMM
+20
+GEMM
+limited operations that move large tensors through memory
+while doing little arithmetic. Prior work has shown that
+0
+BF16
+FP8
+data movement is a central bottleneck in Transformer training [7]; as Figure 1 shows, when training a LLaMA-3-style Figure 1: Runtime breakdown for
+1B model on a single H100 using TorchTitan [11], these LLaMA-3-style 1B model training on a
+non-GEMM operations account for a nontrivial fraction single H100 using TorchTitan.
+
+% of total GPU time
+
+arXiv:2605.19269v2 [cs.LG] 20 May 2026
+
+Driss Guessous4
+
+Arjun Menon2
+
+∗ Part of this work was done at Together AI.
+2 Code available at https://github.com/HanGuo97/coda-kernels.
+
+Preprint.
+
+Norm
+
+QKV
+
+Projection
+
+QKV
+
++ Scale
+
+Projection + RoPE
+
+Attention
+
+Output
+
+Projection
+
+Residual
+
+Output
+ + Partial Norm
+
+Projection + Residual
+
+Norm
+
+Gate/Up
+
+Projection
+
+SwiGLU
+
+Gate/Up
+ + Scale
+
+Projection + SwiGLU
+
+Down
+
+Projection
+
+Residual
+
+Down
+ + Partial Norm
+
+Projection + Residual
+
+Reduction
+
+Memory Bound
+
+Attention
+
+Reduction
+
+Compute Bound
+
+RoPE
+
+Figure 2: Forward pass of a standard Transformer layer. The top row shows the canonical formulation,
+which maps to a mix of compute- and memory-bound kernels. We reparameterize the computation so
+that most memory-bound operations are subsumed into the epilogues of compute-bound kernels.
+of end-to-end runtime. As hardware increasingly accelerates low-precision matrix multiplication
+through formats such as FP8 and FP4, this bottleneck is becoming more important, as the cost of
+materializing intermediate tensors does not improve at the same rate.
+Existing programming models make this issue difficult to address. High-level frameworks such as
+PyTorch express Transformer blocks as operator sequences, with autograd making the backward
+pass similarly convenient. This is productive, but operator boundaries often become materialization
+boundaries and obscure fusion opportunities across forward and backward computation. Productionlevel LLM systems therefore often bypass framework abstractions with hand-written backward passes
+or custom kernels, as in large-scale LLaMA training [5] and inference systems [9, 25]. This work
+asks whether there is a middle ground. That is, is it possible to recover much of the performance of
+custom kernels without giving up the structure needed for programmability and automation?
+Our starting observation is that many Transformer computations that appear at the framework level as
+separate operators can be algebraically reparameterized as GEMM-plus-epilogue programs (Figure 2).
+In this form, a highly optimized GEMM mainloop produces output tiles, while a programmable
+epilogue performs tile-local transformations before the result is written to memory (Figure 3). This
+is efficient on GPUs because the epilogue operates on data that is already produced by the GEMM
+tile, avoiding additional global-memory round trips for intermediate tensors. With modern pipelined
+schedules, this epilogue work can often be placed in the shadow of other tiles’ mainloops, as in Hopper
+Ping-Pong GEMM and Blackwell TMEM-based pipelines. Thus, we extend the epilogue beyond
+a place for simple post-processing such as scaling or bias addition, elevating it into a structured
+interface for fusing memory-bound computation into the lifetime of a GEMM tile.
+Based on the above, we introduce CODA, a kernel abstraction prototype that realizes this interface.
+CODA keeps the GEMM mainloop fixed and exposes a small set of composable epilogue primitives
+for scaling, reductions, pairwise transformations, and accumulation. This programming model is
+deliberately constrained and yet expressive, as after reparameterization, these primitives cover nearly
+the entire forward and backward pass of a standard Transformer model while preserving efficiency.
+CODA inserts computation into the epilogue of a known high-performance GEMM before intermediate
+tensors are materialized in global memory, capturing a broad class of memory-bound computations surrounding dense linear algebra. Transformers are our primary application, but the same
+GEMM-plus-epilogue view applies more broadly whenever high-throughput matrix multiplication is
+surrounded by tile-expressible, data-movement-bound computations.
+Finally, this structure makes automation more practical. Epilogue fusion is already established in
+high-performance GEMM libraries, but applying it to Transformer workloads remains a low-level
+engineering task. CODA targets this gap by providing Transformer-specific epilogue primitives on
+top of a tuned GEMM mainloop. Human or LLM-based authors can assemble these primitives into
+reparameterized Transformer kernels rather than synthesizing arbitrary CUDA. Across representative
+workloads, both authoring modes achieve high performance, suggesting that domain-specific epilogue
+abstractions can make established GEMM fusion techniques more programmable for LLM kernels.
+
+2
+
+Background and Related Works
+
+2.1
+
+Programming Models for LLM Systems
+
+Modern LLM systems are programmed at multiple abstraction levels. Frameworks such as PyTorch and JAX express models as tensor-operator graphs and integrate naturally with automatic
+differentiation, but operator boundaries often become materialization ones.
+Compiler systems lower tensor programs to optimized kernels through graph rewriting, scheduling,
+code generation, and autotuning [1, 2, 19]. Algebraic reformulation is another important source of
+2
+
+performance, as shown by TASO [8] and Mirage [22]. However, rapidly evolving accelerators make
+peak performance a moving target for general-purpose compilers.
+Closer to the hardware level, programmers use kernel DSLs and libraries such as Triton [19],
+ThunderKittens [14, 13, 17], TileLang [20], CuTeDSL [18], Gluon, and TLX, or rely on specialized
+LLM kernels in vLLM [9], SGLang [25], FlashInfer [23], and Liger Kernels [6]. These approaches
+deliver high performance, but extending them to new transformations or backward computations still
+requires substantial low-level engineering.
+2.2
+
+GEMM Mainloops and Epilogue Fusion
+
+Matrix multiplication is the central compute primitive in modern LLM workloads. A highperformance GEMM kernel is typically divided into a mainloop and an epilogue. The mainloop
+performs the tiled matrix multiply-accumulate computation, while the epilogue transforms the
+computed output tile and efficiently writes it back to global memory.
+The epilogue is a natural place to implement fusions because the output of the matmul is already present on chip
+close to compute cores. Practical epilogues commonly perform scaling, bias addition, activations, residual updates,
+data type conversions, tile-wise reductions and other output
+elementwise operations, avoiding separate kernel launches
+and extra global-memory round trips. Modern kernel libraries formalize this separation directly: CUTLASS [18]
+represents GEMM kernels as a composition of a collective mainloop and a collective epilogue, while Epilogue
+Visitor Trees further express epilogues as compositions of
+primitives [4].
+
+Weight
+Input
+On-chip
+
+Memory
+
+Mainloop
+
+Epilogue
+
+Output
+This flexibility operates under a locality constraint. An
+epilogue sees only the local output tile, its accumulators, Figure 3: A GEMM mainloop comand consistently indexed auxiliary tensors, meaning that putes output tiles; the epilogue transoperations requiring global reductions or cross-tile com- forms each tile before the final globalmunication must be reformulated into tile-local pieces or memory store.
+handled in a separate pass. CODA builds on this interface,
+keeping the high-performance GEMM mainloop fixed and using the epilogue as a programmable site
+for nearby memory-bound computation.
+
+3
+
+CODA
+
+The previous section argued that GEMM epilogues are a natural place to fuse memory-bound
+computation into dense linear algebra. We now describe CODA, a GPU kernel abstraction that realizes
+this idea. Section 3.1 identifies a small set of epilogue primitives that map efficiently to GPU
+execution. Section 3.2 shows how the non-attention and non-embedding portions of the Transformer
+forward and backward pass can be reparameterized using these primitives. Finally, Section 3.3
+describes their implementation and our LLM-oriented authoring workflow.
+3.1
+
+Efficient Epilogue Primitives
+
+CODA programs the GEMM epilogue while keeping the mainloop fixed and highly optimized. For
+each output tile, an epilogue may load auxiliary data, transform accumulator values, emit auxiliary
+results, and store the final output. This interface is deliberately restricted to tile-local computation
+rather than arbitrary global communication. Our epilogue template, shown in Section B.1, is inspired
+by Epilogue Visitor Trees [4]. CODA provides five classes of epilogue primitives:
+1. Elementwise and pairwise maps: apply local transformations to accumulator values, including
+residual updates, activations, RoPE-style rotations, and SwiGLU-style gates.
+2. Vector (Rank-1 Tensor) loads and stores: load row or column vectors, broadcast them over an
+output tile, and optionally write vector-valued auxiliary results.
+3
+
+3. Tile (Rank-2 Tensor) loads and stores: load or store matrix tiles, such as residual streams, saved
+activations, or intermediate values needed by the backward pass.
+4. Tile (Rank-2 Tensor) reductions: compute partial reductions over rows or columns of an output
+tile, to be combined later by a lightweight auxiliary kernel.
+5. Stateful transforms: maintain running tile state, such as the max and sum-exp statistics used in
+online log-sum-exp and cross-entropy.
+These primitives are intentionally narrow, operating at a level low enough to compile to efficient
+epilogue code and expressive enough to capture the memory-bound operations surrounding GEMMs
+in our Transformer reparameterizations, as shown next.
+3.2
+
+Reparameterizing Transformers as Epilogues
+
+We now show that the primitive set above is sufficient for much of Transformer computation. After
+lightweight algebraic reparameterization, many non-attention and non-embedding components of a
+standard Transformer forward pass can be written as
+GEMM:
+
+h = xW ,
+
+Epilogue:
+
+y[i, j] = f [i, j](h[i, j]) ,
+
+where [i, j] indexes an output tile and f [i, j] is the tile function implemented in the GEMM epilogue. The epilogue is either fully tile-local, or tile-local up to partial results that are combined
+by a lightweight auxiliary reduction. We first apply this view to the forward pass, then show that
+independent tile functions preserve the same GEMM-epilogue structure in the backward pass.
+3.2.1
+
+GEMM-Residual-RMSNorm-GEMM Pattern
+
+A recurring pattern in pre-normalized Transformers is a GEMM followed by a residual update and
+normalization, then another GEMM. This pattern appears across several adjacent sublayers:
+1. attention output projection → residual stream → RMSNorm → MLP gate/up projection;
+2. MLP down projection → residual stream → RMSNorm → attention QKV projection;
+3. final MLP down projection → residual stream → final RMSNorm → language modeling head.
+Although these cases are usually written as parts of different modules, they share the same computational structure:
+
+
+
+y = RMSNorm(xW0 + z, γ)W1 = r xW0 + z ⊙ γ W1 ,
+where z denotes the residual stream and r = 1/ rms(xW0 + z) is the row-wise inverse RMS factor.
+This pattern crosses the usual module boundary: it couples the output projection of one sublayer with
+the input projection of the next.
+Residual addition and multiplication by the RMSNorm weight γ are tile-local, so they can be fused
+into a GEMM epilogue. The row-wise factor r, however, requires a reduction across the hidden
+dimension, which is larger than a single output tile. In the canonical computation, r is applied before
+the second GEMM, creating an apparent dependency between normalization and the next projection.
+We address the reduction by splitting
+it into two levels. The first GEMM
+epilogue computes tile-local partial
+reductions, and a small auxiliary kernel reduces these partials across tiles
+to obtain r. Since the auxiliary kernel reads a few partial values per tile
+rather than the full activation tensor,
+its memory traffic is much smaller
+than that of a standalone RMSNorm.
+
+Standard
+
+Norm
+
+Inputs
+
+Outputs
+
+GEMM
+Outputs
+
+Outputs
+memory bound kernels
+
+Weight
+
+Reduce
+
+Weight
+
+CODA
+Inputs
+
+Outputs
+Outputs
+
+Figure 4: GEMM-RMSNorm-GEMM reparameterization.
+
+The apparent dependency on r can be
+removed algebraically. Since r is shared across the row, it commutes with the second GEMM:
+
+
+
+
+
+
+y = r xW0 + z ⊙ γ W1 = r xW0 + z ⊙ γ W1 .
+Thus, the row-wise scale does not need to be applied before the second GEMM. It can instead be
+delayed to the epilogue of the second GEMM, after the projection has been computed.
+4
+
+Concretely, the computation decomposes into two GEMMs and one lightweight reduction (Figure 4):
+GEMM 1:
+h0 = xW0 ,
+Epilogue 1:
+h1 [i, j] = h0 [i, j] + z[i, j],
+h2 [i, j] = h1 [i, j] ⊙ γ[j],
+rb[i, j] = partialRMS(h1 [i, j]),
+
+Numerics. The reparameterization changes where the RMSNorm
+scale is applied: the row-wise factor r is delayed from before the second
+GEMM to the second GEMM epilogue. We compare BF16 GEMMRMSNorm-GEMM outputs against an FP32 reference on Llama-3 8B
+layers. We report the errors of CODA and QuACK, on which our GEMM
+template is based, normalized by the error of the standard PyTorch path.
+Figure 6 suggests that a more accurate GEMM mainloop can reduce
+numerical error, and that CODA’s reparameterized epilogue can reduce
+it further.
+
+Error Ratio vs Torch
+
+Speedup
+
+GEMM 2:
+h3 = h2 W1 ,
+Epilogue 2:
+y[i, j] = r[i] h3 [i, j].
+p
+GEMM-Residual-RMS-GEMM
+Here r = 1/ reduce(b
+r ) + ϵ is computed by a small auxiliary
+cuBLAS + PyTorch
+1.15
+CODA (LLM)
+reduction over the tile partials. This decomposition replaces a stanLiger
+1.10
+dalone RMSNorm kernel with tile-local epilogue work around the
+FlashInfer
+1.05
+two GEMMs, plus a lightweight auxiliary reduction.
+1.00
+In Figure 5, we benchmark this reparameterization against existing
+0.95
+implementations on LLaMA-style configurations with a batch of
+0.90
+16K tokens. We vary the hidden dimension across representative
+model scales, with d ∈ {2048, 4096, 8192} corresponding roughly
+0.85
+to 1B, 7B, and 70B models, respectively. Our GEMM-Epilogue
+0.80
+kernel is generated by an LLM provided with the above abstractions
+d=2048 d=4096 d=8192
+(explained in more detail in Section 3.3.1).
+Figure 5: Benchmarks.
+1.2
+1.1
+1.0
+0.9
+0.8
+0.7
+0.6
+0.5
+
+CODA
+
+QuACK
+
+Figure 6: Relative error.
+3.2.2
+
+GEMM with Pairwise Activations
+
+A second common pattern in Transformers is a GEMM followed by a pairwise activation. Unlike an
+elementwise activation, which transforms each feature independently, a pairwise activation consumes
+two adjacent feature values and produces one or two outputs.
+h = xW ,
+ha [i, j], hb [i, j] = split (h[i, j]) ,
+y[i, j] = f [i, j] (ha [i, j], hb [i, j]) .
+This form captures several operations in Transformer blocks:
+• RoPE rotates each feature pair and return two outputs;
+• SwiGLU combines gate and value stream into one output;
+• SwiGLU backward pass maps one incoming gradient into
+gradients for both paired inputs.
+Pairwise activations couple neighboring feature lanes and
+may change the feature dimension. A naive implementation
+materializes the GEMM output, splits it into paires, and
+applies the activation in a separate kernel. This adds memory
+traffic and sometimes materializes an expanded intermediate,
+as in SwiGLU.
+
+Hopper TensorCore
+
+Each thread holds a
+tuple of adjacent values
+Thread 0 Thread 1
+
+...
+
+Pairwise Activation
+
+(RoPE, SwiGLU, etc)
+
+Figure 7: Pairwise activations operate
+Instead, we arrange paired features to be adjacent along the on local feature pairs in the GEMM
+output-feature dimension. This matches the Hopper Tensor epilogue.
+Core accumulator layout exposed to the epilogue, where each
+thread holds a small tuple of adjacent output values in registers before they are stored. The epilogue
+can therefore apply f directly to each pair with register-level computation.
+This removes the standalone activation kernel and avoids materializing the paired intermediate in
+global memory. The same idea applies to dimension-preserving operations such as RoPE, dimensionreducing operations such as SwiGLU, and dimension-expanding operations in the backward pass, as
+long as the pairing is reflected in the GEMM output layout. See Figure 8 for performance benchmarks.
+
+5
+
+Speedup
+
+GEMM + SwiGLU
+
+1.10
+1.05
+1.00
+0.95
+0.90
+0.85
+0.80
+
+GEMM + RoPE
+
+1.2
+
+cuBLAS + PyTorch
+CODA (LLM)
+Liger
+FlashInfer
+
+1.1
+
+0.8
+
+1.05
+0.95
+0.90
+
+0.9
+d=8192
+
+1.10
+1.00
+
+1.0
+
+d=4096
+
+GEMM + Cross Entropy
+
+0.85
+d=4096
+
+d=8192
+
+0.80
+
+d=4096
+
+d=8192
+
+Figure 8: Kernel-level speedups for representative GEMM-plus-epilogue primitives across M N K
+sizes. RoPE uses an output dimension of 3N for QKV projections, and cross-entropy uses a 32K
+vocabulary. Speedups are relative to cuBLAS with torch.compile.
+3.2.3
+
+GEMM with Cross-Entropy Loss
+
+Cross-entropy loss can also be expressed as a GEMM with epilogue-side reductions, as shown by
+Cut Cross-Entropy [21]. Let hi = xi Wlm be the logits for token i, and let yi be its target label. The
+per-token loss is
+X
+ℓi = −hi,yi + log
+exp(hi,k ).
+k
+
+Thus, the loss decomposes into an indexed logit and a row-wise log-sum-exp over vocabulary entries.
+Both terms fit the GEMM-plus-epilogue pattern. The indexed logit can be selected from the GEMM
+output tile using the target label, while the LSE can be accumulated as tile-local maximum and
+sum-exp statistics. A small auxiliary reduction then combines these statistics across tiles, avoiding a
+standalone memory-bound softmax over the full logits.3 See Figure 8 for performance benchmarks.
+3.2.4
+
+Backward Pass
+
+The preceding sections show that much of the Transformer forward pass can be reparameterized as
+GEMMs with epilogues, plus lightweight auxiliary reductions. We now show that the backward pass
+preserves the same structure.
+GEMM with elementwise epilogue. Consider two GEMMs separated by an elementwise epilogue:
+h = xW0 ,
+h′ = f (h),
+y = h′ W1 ,
+where f is applied elementwise. Given an upstream gradient ∇y L, reverse-mode differentiation gives
+∇h′ L = ∇y LW1⊤ ,
+∇h L = ∇h′ L ⊙ f ′ (h),
+∇x L = ∇h LW0⊤ .
+Thus, the backward computation has the same structure as the forward computation: GEMM, local
+transformation, GEMM. The only difference is the direction of fusion. In the forward pass, f is fused
+into the epilogue of the preceding GEMM that produces h; in the backward pass, multiplication by
+f ′ (h) is fused into the epilogue of the following GEMM that produces ∇h′ L (Figure 9).
+Theorem 1. Consider a sequence of GEMM-with-epilogue blocks followed by a final GEMM:
+hℓ = xℓ−1 Wℓ ,
+xℓ [i, j] = fℓ [i, j](hℓ [i, j]) ,
+ℓ = 1, . . . , L − 1,
+hL = xL−1 WL .
+Assume each tile function fℓ [i, j] acts only on its corresponding GEMM output tile. Then the
+activation gradients can be computed with the same GEMM-with-epilogue structure:
+
+∇xℓ−1 L = ∇hℓ LWℓ⊤ ,
+∇hℓ−1 L[i, j] = gℓ−1 [i, j] ∇xℓ−1 L[i, j], hℓ−1 [i, j] ,
+ℓ = L, . . . , 2,
+∇x0 L = ∇h1 LW1⊤ .
+Here gℓ [i, j] is the tile-local backward rule for fℓ [i, j]: it maps the gradient of the epilogue output
+tile xℓ [i, j] to the gradient of the epilogue input tile hℓ [i, j]. The weight gradients are GEMMs:
+∇Wℓ L = x⊤
+ℓ = 1, . . . , L.
+ℓ−1 ∇hℓ L,
+Thus, tile-local epilogues in the forward pass induce tile-local epilogues in the backward pass, while
+the surrounding linear maps remain GEMMs.
+3We use a separate final reduction rather than atomics, and materialize logits to simplify the backward pass.
+
+6
+
+GEMM i-1
+
+Epilogue i-1
+
+GEMM i
+
+Epilogue i-1
+
+Epilogue i
+
+GEMM i
+
+Epilogue i
+
+GEMM i+1
+
+GEMM i+1
+
+Backward
+
+Forward
+
+GEMM i-1
+
+Kernel
+
+Boundary
+
+Figure 9: Forward and backward fusion for GEMM–epilogue blocks. Forward epilogues attach to the
+GEMM that produces their input, while backward epilogues attach to the GEMM that produces the
+gradient with respect to their output.
+Proof sketch. For the GEMM hℓ = xℓ−1 Wℓ , reverse-mode differentiation gives
+∇xℓ−1 L = ∇hℓ LWℓ⊤ ,
+
+∇Wℓ L = x⊤
+ℓ−1 ∇hℓ L,
+
+which are both GEMMs. For the epilogue xℓ [i, j] = fℓ [i, j](hℓ [i, j]), define the local backward rule
+by
+∇hℓ L[i, j] = gℓ [i, j](∇xℓ L[i, j], hℓ [i, j]) .
+Since each fℓ [i, j] depends only on its own tile, the corresponding gℓ [i, j] also acts only on that
+tile. The backward pass therefore introduces no new cross-tile communication and preserves the
+GEMM-with-epilogue structure.
+RMSNorm backward. RMSNorm is the main case where the backward pass is not purely tile-local.
+Its backward rule introduces two reductions: a row-wise statistic needed for the input gradient, and
+a feature-wise reduction across rows for the RMSNorm weight gradient. A direct implementation
+computes both in a standalone RMSNorm backward kernel, requiring additional reads of activationsized tensors. However, the row-wise statistic can be moved to a neighboring GEMM boundary.
+Consider
+h0 = xW0 ,
+
+h1 = f (h0 ),
+
+h2 = RMSNorm(h1 , γ),
+
+y = h2 W1 .
+
+RMSNorm backward requires the row-wise inner product
+s=
+
+1
+sumcols (∇h2 L ⊙ h2 ) .
+d
+
+Using ∇h2 L = ∇y LW1⊤ and y = h2 W1 , this statistic can be equivalently written as
+1
+sumcols (∇y L ⊙ y) .
+d
+This identity changes where the statistic is computed. Instead of launching a standalone RMSNorm
+backward kernel to read h2 and ∇h2 L, we accumulate the same row-wise quantity at a boundary
+where y and ∇y L are already available, thereby exposing the computation to epilogue fusion.
+s=
+
+In consecutive Transformer patterns, each GEMM epilogue can therefore accumulate the row-wise
+statistic needed by the preceding RMSNorm backward. The RMSNorm weight gradient is handled
+similarly by emitting tile partials for the reduction across rows. Overall, RMSNorm backward
+becomes GEMM–epilogue kernels plus lightweight auxiliary reductions over tile partials. We give
+the full derivation and kernel organization in Section A.2, with benchmarks in Figure 11.
+3.3
+
+Implementation
+
+We implement CODA on top of CuTeDSL, which provides Python-level kernel authoring while
+retaining low-level control over details such as layouts and memory movement.
+Data movement. Vector loads handle small broadcast operands such as RMSNorm weights. These
+values are staged once in shared memory and reused across subtiles. Tile loads handle larger operands
+such as residual activations, and uses Tensor Memory Accelerator transfers between global memory
+and shared memory, allowing data movement to overlap with epilogue computation. Stores follow
+similar tile-granular path for transformed outputs, saved intermediates, and reduction partials.
+Local computation. Pairwise maps act on neighboring features, covering dimension-preserving
+operations such as RoPE, dimension-reducing operations such as SwiGLU, and dimension-expanding
+operations in the backward pass. When a map changes the feature dimension, the epilogue performs
+7
+
+GEMM-Residual-PartialRMS-GEMM
+
+Speedup
+
+1.3
+1.2
+
+GEMM-RMS
+
+1.3
+
+1.10
+
+1.2
+
+1.05
+
+1.1
+
+1.00
+
+1.0
+
+0.95
+
+0.9
+1.20
+
+d=4096
+d=8192
+GEMM-RMS-CrossEntropy
+
+1.15
+1.10
+1.05
+1.00
+0.95
+0.90
+
+GEMM-RMS-SwiGLU
+
+1.15
+
+1.1
+1.0
+
+0.90
+
+0.9
+
+d=4096
+d=8192
+GEMM-Residual-PartialRMS-GEMM (Backward)
+
+1.8
+1.6
+
+1.6
+
+1.4
+
+1.4
+
+1.2
+
+1.2
+
+d=8192
+
+d=4096
+
+d=8192
+
+cuBLAS + PyTorch
+CODA (LLM)
+CODA (Human)
+GEMM (cuBLAS)
+GEMM (QuACK)
+GEMM without epilogues
+(i.e., upper bound)
+
+1.0
+
+1.0
+d=4096
+
+d=4096
+d=8192
+GEMM-RMS-SwiGLU (Backward)
+
+GEMM-RMS-RoPE
+
+1.6
+1.5
+1.4
+1.3
+1.2
+1.1
+1.0
+0.9
+
+d=4096
+
+d=8192
+
+d=4096
+
+d=8192
+
+Figure 10: Kernel-level speedups on reparameterized Transformer kernels relative to cuBLAS with
+torch.compile. Raw GEMM baselines using PyTorch/cuBLAS and QuACK are included as
+reference ceilings, since they execute only the matrix multiplication and no epilogue work.
+the corresponding local layout adjustment, such as compacting dimension-reducing outputs or packing
+pairs of 16-bit values for dimension-expanding outputs.
+Reductions. Tile-wise reductions follow the ownership of GEMM output fragments. Row-wise
+reductions are accumulated by the warp that owns the row. Column-wise reductions may span
+multiple warps, so each warp first produces a partial result, and these partials are combined through
+shared memory.
+3.3.1
+
+LLM-Oriented Authoring
+
+CODA is designed both for LLM workloads and for LLM-assisted authoring. Rather than asking a
+model to synthesize arbitrary CUDA or discover a hardware schedule from scratch, CODA exposes a
+constrained space of epilogue programs around expert-designed GEMM mainloops. Its primitives
+already encode efficient implementation strategies, so LLM-based authoring becomes a problem of
+composing vector loads, tile loads, pairwise maps, reductions, and stores for a given Transformer
+computation. This lightweight use of LLMs is complementary to prior work on kernel generation,
+which often relies on orchestration, search, execution feedback, or post-training [12, 16, 3, 10, 24].
+Because CuTeDSL is relatively new, current models have limited exposure to its idioms. We therefore
+provide curated demonstrations for each abstraction. In practice, the repository itself acts as a growing
+demonstration set, with new kernels being written by adapting and composing existing examples.
+Compositions. Transformer kernels often combine several epilogue operations, such as residual
+addition and RMSNorm scaling. Monolithic fused epilogues lead to large, repetitive implementations
+that are difficult to place in context. CODA instead represents each epilogue as a composition of
+reusable primitives: the LLM specifies the local epilogue program, while the library supplies the fixed
+GEMM mainloop and implementation pattern for each primitive. New fused kernels are therefore
+assembled from reusable building blocks instead of being rewritten from scratch.
+
+4
+
+Experiments
+
+After the reparameterizations in Section 3.2, we obtain a compact benchmark suite of GEMM-plusepilogue kernels spanning the Transformer++ forward and backward pass (Section C.1). The suite
+covers nearly all computation outside attention, embeddings, auxiliary reductions, and lightweight
+glue operations. We evaluate two implementations. CODA (LLM) uses Claude Code to generate most
+kernels from a written specification, curated examples, and a running log of implementation tips,
+with lightweight human supervision. CODA (human) is written by human programmers using the
+same high-level reparameterizations, but without access to the exact CODA primitive set.
+We compare against cuBLAS with torch.compile, as well as optimized LLM kernel libraries
+including Liger Kernel [6] and FlashInfer [23]. Because our reparameterized kernels do not always
+8
+
+Layer Forward
+
+d=
+
+d=
+
+d=
+
+81
+92
+d=
+
+40
+96
+d=
+
+20
+48
+d=
+
+92
+d=
+81
+81
+92
+
+0.8
+d=
+
+0.8
+
+40
+96
+
+0.8
+
+d=
+
+0.9
+
+81
+92
+
+0.9
+
+40
+96
+
+0.9
+
+20
+48
+
+1.0
+
+20
+48
+
+1.1
+
+1.0
+
+1.0
+
+96
+
+GEMM-Residual-RMS-GEMM-CrossEntropy
+
+1.2
+
+1.1
+
+1.1
+
+d=
+40
+
+48
+d=
+20
+
+GEMM-Residual-RMS-GEMM-RoPE
+
+1.2
+
+d=
+
+92
+d=
+81
+
+1.2
+
+92
+
+96
+d=
+40
+
+GEMM-Residual-RMS-GEMM-SwiGLU
+
+1.3
+
+d=
+81
+
+48
+d=
+20
+
+0.8
+
+96
+
+0.9
+
+1.10
+1.05
+1.00
+0.95
+0.90
+0.85
+0.80
+d=
+40
+
+1.0
+
+1.10
+1.05
+1.00
+0.95
+0.90
+0.85
+0.80
+48
+
+1.1
+
+Layer Forward + Backward
+
+d=
+20
+
+1.2
+Speedup
+
+Layer Backward
+
+cuBLAS + PyTorch
+CODA (LLM)
+CODA (Human)
+Liger
+FlashInfer
+
+Figure 11: Block-level speedups for reparameterized Transformer kernel sequences, including
+auxiliary reductions and lightweight glue operations. Here, a layer denotes two consecutive GEMMResidual-RMSNorm-GEMM blocks with the SwiGLU and RoPE activations, respectively.
+
+have one-to-one counterparts in existing libraries, we compose the closest available optimized
+primitives and fall back to PyTorch operators as needed. We apply torch.compile to each method
+when compatible. Additional setup details are given in Section C.2.
+Kernel Benchmarks. We first evaluate CODA at the individual-kernel level. Unless otherwise noted,
+we use square GEMM shapes with M =N =K ∈ {4096, 8192}. For cross-entropy kernels, we set
+the vocabulary dimension to 32768. For RoPE kernels, we use Nrope =3N to account for QKV-style
+projections and use precomputed cos and sin tables.4 For kernels that emit partial reductions, we
+benchmark only the fused GEMM kernel with reduction tile size 128; auxiliary reductions are
+included in the block-level benchmarks below. We benchmark functions using Triton’s do_bench
+and show means and standard deviations across 30 runs.
+We evaluate two groups of kernels from Section C.1. The first group consists of standard Transformerstyle kernels, such as GEMM with RoPE, SwiGLU, or cross-entropy epilogues. These kernels have
+close counterparts in existing libraries, so we compare against cuBLAS with torch.compile, Liger
+Kernels, and FlashInfer when applicable. Results are shown in Figure 8.
+The second group consists of reparameterized Transformer forward and backward kernels, which generally do not have one-to-one equivalents in existing libraries. For these kernels, we primarily compare
+against cuBLAS with torch.compile, and additionally report raw GEMM from PyTorch/cuBLAS
+and QuACK.5 These raw GEMM omit epilogue work and therefore serve as reference ceilings for
+the attainable throughput. Results are shown in Figure 10.
+Block Benchmarks. We next benchmark kernel sequences corresponding to Transformer sublayers
+and full layers, which we call blocks. We use hidden sizes in {2048, 4096, 8192}, roughly matching
+1B, 7B, and 70B model scales, with FFN expansion rate 8/3 rounded to multiples of 256 and
+vocabulary size 32768. Unlike isolated kernel benchmarks, these measurements include auxiliary
+reductions and lightweight glue operations.
+4 For CODA, we additionally pre-broadcast and extend these tables across batch, head, and QKV dimensions to avoid
+in-kernel branching, at the cost of additional input traffic.
+5 https://github.com/Dao-AILab/quack
+
+9
+
+For the forward pass, we compare each reparameterized sequence against the closest available
+sequence of optimized operators. For the backward pass, the reparameterization changes the dependency structure: each sublayer emits partial statistics needed by the preceding RMSNorm backward.
+Individual backward sublayers therefore do not have direct PyTorch counterparts, so we report
+backward results at the full-layer level. In CODA, a layer consists of two consecutive GEMM-ResidualRMSNorm-GEMM blocks covering the SwiGLU and RoPE paths. Results are shown in Figure 11.
+
+5
+
+Conclusion and Limitations
+
+CODA reparameterizes much of Transformer computation as GEMM epilogues, reducing memorybound overhead while preserving GEMM efficiency. Its constrained abstraction supports highperformance kernels authored by both humans and LLMs.
+Limitations. Our reparameterizations target a common Transformer architecture; extending them
+to broader model families is future work. CODA currently focuses on single-GPU kernels and does
+not yet address distributed execution. Finally, while reparameterization improves efficiency, it can
+obscure module boundaries and algorithmic semantics, making integration with framework-level
+abstractions more challenging.
+
+Acknowledgment
+We thank Beshr Islam Bouli, Kaiming Cheng, Xinle Cheng, Ryan Chin, Tarushii Goel, Wentao Guo,
+Lucas Torroba Hennigen, Alicia Li, Mayank Mishra, Jyothish Pari, Caiming Xiong, Nicholas Yap,
+Tianyuan Zhang, and Adam Zweiger for helpful discussion. We gratefully acknowledge the support
+of the Schmidt Sciences AI2050 fellowship, the Google ML and Systems Junior Faculty Awards, the
+Google Research Scholar program, and the National Science Foundation (Award #2441872).
+
+References
+[1] J. Ansel, E. Yang, H. He, N. Gimelshein, A. Jain, M. Voznesensky, B. Bao, P. Bell, D. Berard,
+E. Burovski, et al. Pytorch 2: Faster machine learning through dynamic python bytecode
+transformation and graph compilation. In Proceedings of the 29th ACM international conference
+on architectural support for programming languages and operating systems, volume 2, pages
+929–947, 2024.
+[2] T. Chen, T. Moreau, Z. Jiang, L. Zheng, E. Yan, H. Shen, M. Cowan, L. Wang, Y. Hu, L. Ceze,
+et al. {TVM}: An automated {End-to-End} optimizing compiler for deep learning. In 13th
+USENIX Symposium on Operating Systems Design and Implementation (OSDI 18), pages
+578–594, 2018.
+[3] W. Chen, J. Zhu, Q. Fan, Y. Ma, and A. Zou. Cuda-llm: Llms can write efficient cuda kernels.
+arXiv preprint arXiv:2506.09092, 2025.
+[4] Z. Chen, A. Kerr, R. Cai, J. Kosaian, H. Wu, Y. Ding, and Y. Xie. Evt: Accelerating deep
+learning training with epilogue visitor tree. In Proceedings of the 29th ACM International
+Conference on Architectural Support for Programming Languages and Operating Systems,
+Volume 3, pages 301–316, 2024.
+[5] A. Grattafiori, A. Dubey, A. Jauhri, A. Pandey, A. Kadian, A. Al-Dahle, A. Letman, A. Mathur,
+A. Schelten, A. Vaughan, et al. The llama 3 herd of models. arXiv preprint arXiv:2407.21783,
+2024.
+[6] P.-L. Hsu, Y. Dai, V. Kothapalli, Q. Song, S. Tang, S. Zhu, S. Shimizu, S. Sahni, H. Ning, and
+Y. Chen. Liger kernel: Efficient triton kernels for llm training. arXiv preprint arXiv:2410.10989,
+2024.
+[7] A. Ivanov, N. Dryden, T. Ben-Nun, S. Li, and T. Hoefler. Data movement is all you need: A case
+study on optimizing transformers. Proceedings of Machine Learning and Systems, 3:711–732,
+2021.
+10
+
+[8] Z. Jia, O. Padon, J. Thomas, T. Warszawski, M. Zaharia, and A. Aiken. Taso: optimizing deep
+learning computation with automatic generation of graph substitutions. In Proceedings of the
+27th ACM Symposium on Operating Systems Principles, pages 47–62, 2019.
+[9] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Stoica.
+Efficient memory management for large language model serving with pagedattention. In
+Proceedings of the 29th symposium on operating systems principles, pages 611–626, 2023.
+[10] R. T. Lange, Q. Sun, A. Prasad, M. Faldor, Y. Tang, and D. Ha. Towards robust agentic cuda
+kernel benchmarking, verification, and optimization. arXiv preprint arXiv:2509.14279, 2025.
+[11] W. Liang, T. Liu, L. Wright, W. Constable, A. Gu, C.-C. Huang, I. Zhang, W. Feng, H. Huang,
+J. Wang, et al. Torchtitan: One-stop pytorch native solution for production ready llm pre-training.
+arXiv preprint arXiv:2410.06511, 2024.
+[12] A. Ouyang, S. Guo, S. Arora, A. L. Zhang, W. Hu, C. Ré, and A. Mirhoseini. Kernelbench:
+Can llms write efficient gpu kernels? arXiv preprint arXiv:2502.10517, 2025.
+[13] B. Spector, J. Juravsky, S. Sul, O. Dugan, D. Lim, D. Fu, S. Arora, and C. Ré. Look ma, no
+bubbles! designing a low-latency megakernel for llama-1b, 2025.
+[14] B. F. Spector, S. Arora, A. Singhal, D. Y. Fu, and C. Ré. Thunderkittens: Simple, fast, and
+adorable ai kernels. arXiv preprint arXiv:2410.20399, 2024.
+[15] J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu. Roformer: Enhanced transformer with
+rotary position embedding. Neurocomputing, 568:127063, 2024.
+[16] S. Su, X. Sun, X. Li, A. Wang, J. Li, and C. Shum. Cuda-l2: Surpassing cublas performance for
+matrix multiplication through reinforcement learning. arXiv preprint arXiv:2512.02551, 2025.
+[17] S. H. Sul, S. Arora, B. F. Spector, and C. Ré. Parallelkittens: Systematic and practical
+simplification of multi-gpu ai kernels. arXiv preprint arXiv:2511.13940, 2025.
+[18] V. Thakkar, P. Ramani, C. Cecka, A. Shivam, H. Lu, E. Yan, J. Kosaian, M. Hoemmen,
+H. Wu, A. Kerr, M. Nicely, D. Merrill, D. Blasig, A. Atluri, F. Qiao, P. Majcher, P. Springer,
+M. Hohnerbach, J. Wang, and M. Gupta. CUTLASS, Jan. 2023. URL https://github.com/
+NVIDIA/cutlass.
+[19] P. Tillet, H.-T. Kung, and D. Cox. Triton: an intermediate language and compiler for tiled neural
+network computations. In Proceedings of the 3rd ACM SIGPLAN International Workshop on
+Machine Learning and Programming Languages, pages 10–19, 2019.
+[20] L. Wang, Y. Cheng, Y. Shi, Z. Tang, Z. Mo, W. Xie, L. Ma, Y. Xia, J. Xue, F. Yang, et al. Tilelang:
+A composable tiled programming model for ai systems. arXiv preprint arXiv:2504.17577, 2025.
+[21] E. Wijmans, B. Huval, A. Hertzberg, V. Koltun, and P. Krähenbühl. Cut your losses in largevocabulary language models. In International Conference on Learning Representations, 2025.
+[22] M. Wu, X. Cheng, S. Liu, C. Shi, J. Ji, M. K. Ao, P. Velliengiri, X. Miao, O. Padon, and Z. Jia.
+Mirage: A {Multi-Level} superoptimizer for tensor programs. In 19th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 25), pages 21–38, 2025.
+[23] Z. Ye, L. Chen, R. Lai, W. Lin, Y. Zhang, S. Wang, T. Chen, B. Kasikci, V. Grover, A. Krishnamurthy, et al. Flashinfer: Efficient and customizable attention engine for llm inference serving.
+Proceedings of Machine Learning and Systems, 7, 2025.
+[24] M. Yuksekgonul, D. Koceja, X. Li, F. Bianchi, J. McCaleb, X. Wang, J. Kautz, Y. Choi, J. Zou,
+C. Guestrin, et al. Learning to discover at test time. arXiv preprint arXiv:2601.16175, 2026.
+[25] L. Zheng, L. Yin, Z. Xie, C. L. Sun, J. Huang, C. H. Yu, S. Cao, C. Kozyrakis, I. Stoica, J. E.
+Gonzalez, et al. Sglang: Efficient execution of structured language model programs. Advances
+in neural information processing systems, 37:62557–62583, 2024.
+
+11
+
+A
+
+Backward Pass
+
+A.1
+
+Tile-wise Epilogue
+
+Partition the GEMM output h into tiles h[i,j] . A tile-wise epilogue applies an independent transformation to each tile:
+
+
+f [0, 0] (h[0, 0])
+···
+f [0, N ] (h[0, N ])
+
+
+..
+..
+..
+h = xW0 ,
+h′ = 
+y = h′ W1 .
+,
+.
+.
+.
+f [M, 0] (h[M, 0]) · · · f [M, N ] (h[M, N ])
+The backward pass has the same block structure.
+g[0, 0] (∇h′ L[0, 0])
+..
+.
+g[M, 0] (∇h′ L[M, 0])
+
+
+∇h′ L = ∇y LW1⊤ ,
+
+
+∇h L = 
+
+···
+..
+.
+···
+
+
+g[0, N ] (∇h′ L[0, N ])
+
+..
+,
+.
+g[M, N ] (∇h′ L[M, N ])
+
+∇x L = ∇h LW0⊤ .
+
+Here each g[i, j] is the local backward rule for the corresponding tile:
+
+
+∂ vec (f [i, j] (h[i, j]))
+⊤
+g[i, j](∆) = unvec J[i,j]
+vec(∆) ,
+J[i,j] =
+.
+∂ vec (h[i, j])
+Thus, each gradient tile depends only on the corresponding forward tile and upstream gradient tile.
+No cross-tile communication is introduced, so the backward operation remains tile-local and can be
+implemented as a GEMM epilogue. As shown in Figure 9, the only structural change is the direction
+of fusion: forward epilogues are fused into the GEMM that produces their input, while backward
+epilogues are fused into the GEMM that produces the gradient with respect to their output.
+A.2
+
+GEMM-RMSNorm-GEMM Backward Pass
+
+We now describe the backward pass for the GEMM–epilogue–RMSNorm–GEMM pattern. RMSNorm is the first case where the backward pass is not purely tile-local. The reason is simple:
+RMSNorm contains a row-wise normalization factor, so its backward pass needs a row-wise statistic.
+In addition, the RMSNorm weight γ is shared across rows, so its gradient requires a reduction
+across the row dimension. The goal of this section is to show that these are the only non-local
+pieces. Everything else can still be fused into GEMM epilogues, with the non-local pieces handled
+by lightweight reductions over tile partials.
+Consider the forward computation
+h0 = xW0 ,
+
+h1 = f (h0 ),
+
+h2 = RMSNorm(h1 , γ),
+⊤
+
+y = h2 W1 .
+⊤
+
+Let r be the row-wise inverse RMS factor. We write r = r1 and γ = 1γ for the broadcasts of r
+and γ to the shape of h1 . Then
+h2 = r ⊙ h1 ⊙ γ.
+Given the upstream gradient ∇y L, the first backward operation is the GEMM
+∇h2 L = ∇y LW1⊤ .
+The RMSNorm backward can be written as
+∇h1 L = r ⊙ (∇h2 L ⊙ γ − r ⊙ h1 ⊙ s) ,
+∇γ L = sumrows (∇h2 L ⊙ h1 ⊙ r) ,
+where s = s1⊤ broadcasts one scalar per row. The row-wise statistic s is
+1
+s = ⊙ r ⊙ sumcols (∇h2 L ⊙ γ ⊙ h1 ) ,
+d
+1
+= sumcols (∇h2 L ⊙ r ⊙ γ ⊙ h1 ) ,
+d
+1
+= sumcols (∇h2 L ⊙ h2 ) ,
+d
+12
+
+where d is the hidden dimension. This expression identifies the two non-local operations in RMSNorm
+backward. The statistic s is a reduction across columns, producing one scalar per row. The weight
+gradient ∇γ L is a reduction across rows, producing one scalar per hidden feature.
+A standalone RMSNorm backward kernel would compute these reductions by reading activation-sized
+tensors. The key observation is that the row-wise statistic s can be moved to a different boundary.
+Using ∇h2 L = ∇y L W1⊤ and y = h2 W1 , we have
+1
+sumcols (∇h2 L ⊙ h2 ) ,
+d
+
+1
+= sumcols (∇y LW1⊤ ) ⊙ h2
+d
+
+1
+= diag (∇y LW1⊤ ) h⊤
+2
+d
+
+1
+= diag ∇y L (h2 W1 )⊤
+d
+1
+= sumcols (∇y L ⊙ (h2 W1 ))
+d
+1
+= sumoutput (∇y L ⊙ y) .
+d
+Intuitively, the RMSNorm backward needs the inner product between an activation and its gradient
+along each row. The identity above says that this inner product can be computed either before or after
+the following GEMM. This lets us compute the statistic at a boundary where y and ∇y L are already
+available.
+s=
+
+This is useful because Transformer layers contain consecutive GEMM–epilogue–RMSNorm–GEMM
+patterns. During the backward pass of one pattern, the GEMM that produces ∇x L already has access
+to both x and ∇x L. Since this x is the output of the preceding pattern, the epilogue of the current
+pattern can accumulate the RMSNorm statistic needed by the preceding pattern:
+1
+reduce (b
+sprev ) .
+d
+Thus, each pattern computes the row-wise RMSNorm backward statistic required by the pattern
+before it. The reduction is still present, but it is now a small reduction over tile partials rather than a
+standalone activation-sized RMSNorm backward kernel.
+sbprev = reduceTilecols (x ⊙ ∇x L) ,
+
+sprev =
+
+The RMSNorm weight gradient is handled similarly, except that its reduction is across rows rather
+than columns. We accumulate tile partials in the RMSNorm backward epilogue:
+
+
+[
+[
+∇
+∇γ L = reducerows ∇
+γ L = reduceTilerows (∇h2 L ⊙ h1 ⊙ r) ,
+γL .
+Putting these pieces together, the backward pass is organized as follows:
+GEMM 1: ∇h2 L = ∇y LW1⊤ ,
+Epilogue 1: ∇h1 L = r ⊙ (∇h2 L ⊙ γ − h1 ⊙ r ⊙ s) ,
+∇h0 L = g(∇h1 L),
+[
+∇
+γ L = reduceTilerows (∇h2 L ⊙ h1 ⊙ r) ,
+GEMM 2: ∇x L = ∇h0 LW0⊤ ,
+Epilogue 2: sbprev = reduceTilecols (x ⊙ ∇x L) ,
+Auxiliary reductions:
+
+1
+reducecols (b
+sprev ) ,
+d
+
+
+[
+∇γ L = reducerows ∇
+γL .
+
+sprev =
+
+Here g denotes the tile-local backward rule for the epilogue f . The statistic s used in Epilogue 1 is
+assumed to have already been accumulated by the following pattern in the backward order.
+13
+
+Finally, the output of a pattern often passes through another epilogue before the next pattern begins:
+h0 = xW0 ,
+
+h1 = f0 (h0 ),
+
+h2 = RMSNorm(h1 , γ),
+
+h3 = h2 W1
+
+y = f1 (h3 ).
+
+In this case, the statistic should be accumulated using the pre-epilogue tensor h3 and its gradient.
+The backward rule for f1 is tile-local, so it can be fused before accumulating the statistic:
+GEMM 2:
+Epilogue 2:
+
+∇x L = ∇h0 LW0⊤ ,
+←
+−
+− L = f1 (∇x L),
+∇←
+h
+
+3
+←
+
+−
+−L
+sbprev = reduceTilecols h3 ⊙ ∇←
+h
+3
+
+←
+−
+←
+−
+Here h3 denotes the pre-epilogue GEMM output from the preceding pattern, and f1 denotes the local
+backward rule for its following epilogue. This case preserves the same structure: apply the local
+backward epilogue first, then accumulate the row-wise statistic from the pre-epilogue activation and
+its gradient.
+Overall, this organization removes the activation-sized RMSNorm backward kernel. The remaining
+non-local work consists only of reductions over tile partials: a column reduction for the row-wise
+RMSNorm statistic, and a row reduction for the RMSNorm weight gradient. The GEMMs and
+local backward updates are fused into GEMM epilogues, preserving the same GEMM-plus-epilogue
+structure used in the forward pass.
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+
+B
+
+CODA
+
+B.1
+
+Epilogue Template
+
+# --- Mainloop --# ...
+# --- Pre - loop : visitor tree entry points --epilogue . consu mer_be gin (...)
+epilogue . produ cer_be gin (...)
+# --- Main loop : epilogue tiles --for epi_idx in range ( num_epi_tiles ) :
+# Per - tile visitor entry
+epilogue . c o n s u m e r _ b e g i n _ l o o p (...)
+# Producer - side async load ( e . g . , TMA )
+epilogue . p r o d u c e r _ t m a _ l o a d (...)
+# Core epilogue computation
+rD = l o a d _ a c c u m u l a t o r _ f r a g m e n t (...)
+epilogue . con sumer_ visit ( rD , ...)
+# Registers -> shared memory
+s t o r e _ r e g s _ t o _ s m e m (...)
+# Pre - store visitor hook
+epilogue . c o n s u m e r _ s m e m _ s t o r e (...)
+t m a _ s t o r e _ f r o m _ s m e m _ t o _ g m e m (...)
+epilogue . c o n s u m e r _ t m a _ s t o r e (...)
+# Per - tile visitor exit
+epilogue . c o n s u m e r _ e n d _ l o o p ( gmem_coord )
+# --- Post - loop : visitor tree finalization --epilogue . consumer_end (...)
+
+Listing 1: Epilogue Kernel Abstraction.
+B.2
+
+Epilogue Example
+
+1 def _ c r e a t e _ m e a n _ s q _ r e d u c t i o n _ o p ( element_type , i nv_blo ck_siz e ) :
+2
+" " " Create a reduction op that accumulates mean of squares : acc + val ^2 *
+
+inv_ block_ size .
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+The combine_fn squares each new element and scales by 1/ block_size before adding
+to the accumulator . The warp - level reduction uses standard addition since partial
+sums are already accumulated and scaled .
+"""
+init_value = element_type (0.)
+inv_bs = element_type ( inv_bl ock_si ze )
+_sq_combine = lambda x , y : x + y * y * inv_bs
+
+14
+
+12
+_add_wrp = lambda tree_x , tree_y : pytree . tree_map ( operator . add , tree_x , tree_y )
+13
+14
+return B l o c k R e d u c t i o n O p (
+15
+combine_fn = lambda tree_x , tree_y : pytree . tree_map ( _sq_combine , tree_x , tree_y ) ,
+16
+reduce_ssa = None ,
+17
+reduce_wrp = lambda xs : pytree . tree_map (
+18
+lambda x : cute . arch . warp _reduc tion (
+19
+x,
+20
+op = _add_wrp ,
+21
+t h r e a d s _ i n _ g r o u p = HOPPER_WARP_REDUCTION_WIDTH ,
+22
+),
+23
+xs ,
+24
+),
+25
+init_value = init_value ,
+26
+)
+27
+28
+29 class E V T R o w V e c M u l P o s t A c t ( E p i l o g u e V i s i t o r T r e e ) :
+30
+"""
+31
+Loads a per - N row vector W ( cp . async to smem , then s2r ) , multiplies the
+32
+accumulator by W into a separate register tile , and stores that scaled
+33
+tile to a side output mPostAct via TMA . tRS_rD itself is left unchanged
+34
+so the main D output ( the unscaled GEMM result ) is unaffected .
+35
+36
+This mirrors the rowvec = norm_weight side - output path of trainstation ’s
+37
+‘ gemm_partial_rms_fwd ‘ , kept local to this kernel rather than as a
+38
+general - purpose rapier EVT .
+39
+40
+Inputs :
+41
+- GEMM output ( in registers ) : [ M x N ] , unchanged by this op
+42
+- mRowVec : [L , N ] - RMSNorm weight , broadcast along M
+43
+44
+Outputs :
+45
+- mPostAct : [ M x N ] = D * W ( side output , written via TMA )
+46
+"""
+47
+48
+@struct_utils . ml i r_ n am ed t up le
+49
+class E p i l o g u e A r g u m e n t s ( NamedTuple ) :
+50
+mPostAct : cute . Tensor | None
+51
+mRowVec : cute . Tensor | None
+52
+53
+@struct_utils . r e g i s t e r _ p y t r e e _ d a t a c l a s s
+54
+@dataclass
+55
+class E pilogu ePara ms ( E p i l o g u e V i s i t o r T r e e . Ep ilogue Param s ) :
+56
+mPostAct : cute . Tensor | None
+57
+mRowVec : cute . Tensor | None
+58
+epi_tma_atom : cute . CopyAtom
+59
+ep i _g me m _l ay o ut : cutlass . utils . LayoutEnum
+60
+e p i _ s m e m _ l a y o u t _ s t a g e d : cute . Layout
+61
+62
+@struct_utils . r e g i s t e r _ p y t r e e _ d a t a c l a s s
+63
+@dataclass
+64
+class E p i l o g u e T e n s o r s S M e m ( E p i l o g u e V i s i t o r T r e e . E p i l o g u e T e n s o r s S M e m ) :
+65
+sPostAct : cute . Tensor | None
+66
+sRowVec : cute . Tensor | None
+67
+68
+@struct_utils . r e g i s t e r _ p y t r e e _ d a t a c l a s s
+69
+@dataclass
+70
+class E pi lo g ue Te n so r s ( E p i l o g u e V i s i t o r T r e e . E pi lo g ue T en so r s ) :
+71
+tDsPostAct : cute . Tensor
+72
+tDgPostAct : cute . Tensor
+73
+tRS_sPostAct : cute . Tensor
+74
+epi_tma_atom : cute . CopyAtom
+75
+t i l e d _ c o p y _ p o s t a c t _ r 2 s : cute . TiledCopy
+76
+tDsRowVec : cute . Tensor | None
+77
+78
+@struct_utils . r e g i s t e r _ p y t r e e _ d a t a c l a s s
+79
+@dataclass
+80
+class E p i l o g u e T e n s o r s L o o p ( E p i l o g u e V i s i t o r T r e e . E p i l o g u e T e n s o r s L o o p ) :
+81
+tDsPostAct : cute . Tensor
+82
+tDgPostAct : cute . Tensor
+83
+tRS_rPostAct : cute . Tensor | None
+84
+tRS_sPostAct : cute . Tensor
+85
+epi_tma_atom : cute . CopyAtom
+86
+t i l e d _ c o p y _ p o s t a c t _ r 2 s : cute . TiledCopy
+87
+tDrRowVec_epi : cute . Tensor | None
+88
+89
+@struct_utils . r e g i s t e r _ p y t r e e _ d a t a c l a s s
+90
+@dataclass
+91
+class E p i l o g u e P i p e l i n e s ( E p i l o g u e V i s i t o r T r e e . E p i l o g u e P i p e l i n e s ) :
+92
+pass
+
+15
+
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+152
+153
+154
+155
+156
+157
+158
+159
+160
+161
+162
+163
+164
+165
+166
+167
+168
+169
+170
+171
+172
+173
+
+def __init__ (
+self ,
+acc_dtype : type [ cute . Numeric ] ,
+po st_act _dtype : type [ cute . Numeric ] ,
+ti le_sha pe_mnk : tuple [ int , int , int ] ,
+b u f f e r _ a l i g n _ b y t e s : int ,
+) -> None :
+super () . __init__ ()
+self . arch = 90
+self . acc_dtype = acc_dtype
+self . post_a ct_dty pe = pos t_act_ dtype
+self . c on ta i ne r _d ty p e = po st_act _dtyp e
+self . tile_s hape_m nk = til e_shap e_mnk
+self . b u f f e r _ a l i g n _ b y t e s = b u f f e r _ a l i g n _ b y t e s
+@cute . jit
+def t o _ u n d e r l y i n g _ a r g u m e n t s (
+self ,
+epi_tile : cute . Tile ,
+epi_stage : int ,
+ep i_load _stag e : int ,
+epi_args : EpilogueArguments ,
+) -> E pilogu eParam s :
+if cutlass . const_expr ( epi_args . mPostAct is not None ) :
+mPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_args . mPostAct )
+misc_utils . static_assert ( get_dtype ( mPostAct ) is self . co n ta in e r_ dt y pe )
+(
+epi_gmem_layout ,
+epi_smem_layout_staged ,
+epi_tma_atom ,
+epi_tma_tensor ,
+) = epil ogue_u tils . prepare_tma (
+tma_op = " s2g " ,
+epi_tile = epi_tile ,
+epi_stage = epi_stage ,
+epi_tensor = mPostAct ,
+)
+if cutlass . const_expr ( epi_args . mRowVec is not None ) :
+misc_utils . static_assert ( epi_args . mPostAct is not None )
+mRowVec = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_args . mRowVec )
+mRowVec = layout_utils . a s s u m e d _ a l i g n _ s t r i d e (
+mRowVec ,
+assumed_align =4 ,
+)
+else :
+mRowVec = None
+return self . E pilogu eParam s (
+mPostAct = epi_tma_tensor ,
+mRowVec = mRowVec ,
+epi_tma_atom = epi_tma_atom ,
+e pi _ gm em _ la y ou t = epi_gmem_layout ,
+e p i _ s m e m _ l a y o u t _ s t a g e d = epi_smem_layout_staged ,
+)
+@cute . jit
+def p r e f e t c h _ t m a _ d e s c r i p t o r s (
+self ,
+epi_params : EpilogueParams ,
+) -> None :
+cute . nvgpu . cpasync . p r e f e t c h _ d e s c r i p t o r ( epi_params . epi_tma_atom )
+@cute . jit
+def con sumer_ begin (
+self ,
+ti led_co py_r2 s : cute . TiledCopy ,
+ti l e_ co o rd _m n kl : cute . Coord ,
+tidx : cute . Int32 ,
+tiled_mma : cute . TiledMma ,
+tRS_rD_layout : cute . Layout ,
+epi_tile : cute . Tile ,
+ep i _n um _ th re a ds : int ,
+e p i _ n u m _ m a t r i c e s : int ,
+epi_barrier : cutlass . pipeline . NamedBarrier ,
+epi_params : EpilogueParams ,
+e p i _ t e n s o r s _ s m e m : EpilogueTensorsSMem ,
+) -> Ep i lo gu e Te n so rs :
+
+16
+
+174
+175
+176
+177
+178
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+191
+192
+193
+194
+195
+196
+197
+198
+199
+200
+201
+202
+203
+204
+205
+206
+207
+208
+209
+210
+211
+212
+213
+214
+215
+216
+217
+218
+219
+220
+221
+222
+223
+224
+225
+226
+227
+228
+229
+230
+231
+232
+233
+234
+235
+236
+237
+238
+239
+240
+241
+242
+243
+244
+245
+246
+247
+248
+249
+250
+251
+252
+253
+254
+
+tile_M = self . til e_shap e_mnk [0]
+tile_N = self . til e_shap e_mnk [1]
+m_idx , n_idx , _ , batch_idx = ti le _ co or d _m n kl
+thr_copy_r2s = ti led_co py_r2s . get_slice ( tidx )
+# Side output ( PostAct ) TMA setup
+mPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_params . mPostAct )
+sPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ s m e m . sPostAct )
+tiled_copy_postact_r2s , _ , tRS_sPostAct = ep ilogue _util s . p r e p a r e _ c o p y _ r 2 s _ s m 9 0 (
+tiled _copy_ r2s = tiled_copy_r2s ,
+tidx = tidx ,
+dst = sPostAct ,
+epi_layout = epi_params . epi_gmem_layout ,
+epi_dtype = self . container_dtype ,
+acc_dtype = self . acc_dtype ,
+)
+gPostAct = mPostAct [ None , None , batch_idx ]
+gPostAct = cute . local_tile ( gPostAct , ( tile_M , tile_N ) , ( m_idx , n_idx ) )
+gPostAct = cute . zipped_divide ( gPostAct , epi_tile )
+tDsPostAct , tDgPostAct = cute . nvgpu . cpasync . tma_partition (
+atom = epi_params . epi_tma_atom ,
+cta_coord =0 ,
+cta_layout = cute . make_layout (1) ,
+smem_tensor = cute . group_modes ( sPostAct , 0 , cute . rank ( sPostAct ) - 1) ,
+gmem_tensor = cute . group_modes ( gPostAct , 0 , cute . rank ( gPostAct ) - 1) ,
+)
+# RowVec cp . async load ( per - N broadcast across M )
+if cutlass . const_expr ( epi_params . mRowVec is not None ) :
+mRowVec = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_params . mRowVec )
+sRowVec = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ s m e m . sRowVec )
+mRowVec = mRowVec [ batch_idx , None ]
+gRowVec = cute . local_tile ( mRowVec , ( tile_N ,) , ( n_idx ,) )
+cRowVec = cute . m a k e _ i d e n t i t y _ t e n s o r ( tile_N )
+limit_n = min ( mRowVec . shape [0] - n_idx * tile_N , tile_N )
+memory_utils . g2s_copy_1d (
+src = gRowVec ,
+dst = sRowVec ,
+crd = cRowVec ,
+shape =( limit_n ,) ,
+num_threads = epi_num_threads ,
+thread_index = tidx ,
+)
+s R o w V e c _ v i e w _ l a y o u t = cute . make_layout (
+shape =( tile_M , tile_N ) ,
+stride =(0 , 1) ,
+)
+sRowVec_view = cute . make_tensor (
+iterator = sRowVec . iterator ,
+layout = sRowVec_view_layout ,
+)
+tDsRowVec = thr_copy_r2s . partition_S (
+cute . flat_divide ( sRowVec_view , epi_tile )
+)
+cute . arch . c p _ a s y n c _ c o m m i t _ g r o u p ()
+cute . arch . c p _ a s y n c _ w a i t _ g r o u p (0)
+epi_barrier . a rr i ve _a n d_ w ai t ()
+else :
+tDsRowVec = None
+return self . Ep i lo g ue Te n so rs (
+tDsPostAct = tDsPostAct ,
+tDgPostAct = tDgPostAct ,
+tRS_sPostAct = tRS_sPostAct ,
+epi_tma_atom = epi_params . epi_tma_atom ,
+t i l e d _ c o p y _ p o s t a c t _ r 2 s = tiled_copy_postact_r2s ,
+tDsRowVec = tDsRowVec ,
+)
+@cute . jit
+def consumer_end (
+self ,
+ti led_co py_r2 s : cute . TiledCopy ,
+ti l e_ co o rd _m n kl : cute . Coord ,
+tidx : cute . Int32 ,
+shape_mnk : cute . Shape ,
+epi_tile : cute . Tile ,
+ep i _n um _ th re a ds : int ,
+epi_barrier : cutlass . pipeline . NamedBarrier ,
+epi_params : EpilogueParams ,
+
+17
+
+255
+256
+257
+258
+259
+260
+261
+262
+263
+264
+265
+266
+267
+268
+269
+270
+271
+272
+273
+274
+275
+276
+277
+278
+279
+280
+281
+282
+283
+284
+285
+286
+287
+288
+289
+290
+291
+292
+293
+294
+295
+296
+297
+298
+299
+300
+301
+302
+303
+304
+305
+306
+307
+308
+309
+310
+311
+312
+313
+314
+315
+316
+317
+318
+319
+320
+321
+322
+323
+324
+325
+326
+327
+328
+329
+330
+331
+332
+333
+334
+
+epi_tensors : EpilogueTensors ,
+e p i _ t e n s o r s _ s m e m : EpilogueTensorsSMem ,
+) -> None :
+pass
+@cute . jit
+def c o n s u m e r _ b e g i n _ l o o p (
+self ,
+epi_coord : cute . Coord ,
+epi_params : EpilogueParams ,
+epi_tensors : EpilogueTensors ,
+epi_pipelines : EpiloguePipelines ,
+) -> tuple [ EpilogueTensorsLoop , E p i l o g u e P i p e l i n e s ]:
+if cutlass . const_expr ( epi_tensors . tDsRowVec is not None ) :
+tDsRowVec = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_tensors . tDsRowVec )
+tDsRowVec_cur = cute . group_modes ( tDsRowVec , 3 , cute . rank ( tDsRowVec ) )
+tDsRowVec_cur = tDsRowVec_cur [ None , None , None , epi_coord ]
+tDrRowVec_cvt = memory_utils . s2r_copy_1d ( tDsRowVec_cur , dtype = self . acc_dtype )
+else :
+tDrRowVec_cvt = None
+return (
+self . E p i l o g u e T e n s o r s L o o p (
+tDsPostAct = epi_tensors . tDsPostAct ,
+tDgPostAct = epi_tensors . tDgPostAct ,
+tRS_rPostAct = None ,
+tRS_sPostAct = epi_tensors . tRS_sPostAct ,
+epi_tma_atom = epi_tensors . epi_tma_atom ,
+t i l e d _ c o p y _ p o s t a c t _ r 2 s = epi_tensors . tiled_copy_postact_r2s ,
+tDrRowVec_epi = tDrRowVec_cvt ,
+),
+self . E p i l o g u e P i p e l i n e s () ,
+)
+@cute . jit
+def con sumer_ visit (
+self ,
+tRS_rD : cute . Tensor ,
+shape_mnk : cute . Shape ,
+epi_params : EpilogueParams ,
+e p i _ t e n s o r s _ l o o p : EpilogueTensorsLoop ,
+) -> E p i l o g u e T e n s o r s L o o p :
+tRS_rPostAct = cr eation _utils . a l l o c a t e _ t e n s o r _ l i k e (
+tensor = tRS_rD ,
+memspace = " rmem " ,
+smem_ alloca tor = None ,
+dtype = self . acc_dtype ,
+)
+if cutlass . const_expr ( self . arch < 100) :
+if cutlass . const_expr ( e p i _ t e n s o r s _ l o o p . tDrRowVec_epi is not None ) :
+tDrRowVec_epi = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ l o o p .
+tDrRowVec_epi )
+for i in cutlass . r an g e_ co n st e xp r ( cute . size ( tRS_rPostAct ) ) :
+tRS_rPostAct [ i ] = tRS_rD [ i ] * tDrRowVec_epi [ i ]
+else :
+for i in cutlass . r an g e_ co n st e xp r ( cute . size ( tRS_rPostAct ) ) :
+tRS_rPostAct [ i ] = tRS_rD [ i ]
+else :
+raise N o t I m p l e m e n t e d E r r o r
+tRS_rPostAct = dtype_utils . convert (
+tRS_rPostAct ,
+dtype = self . post_act_dtype ,
+)
+return self . E p i l o g u e T e n s o r s L o o p (
+tDsPostAct = e p i _ t e n s o r s _ l o o p . tDsPostAct ,
+tDgPostAct = e p i _ t e n s o r s _ l o o p . tDgPostAct ,
+tRS_rPostAct = tRS_rPostAct ,
+tRS_sPostAct = e p i _ t e n s o r s _ l o o p . tRS_sPostAct ,
+epi_tma_atom = e p i _ t e n s o r s _ l o o p . epi_tma_atom ,
+t i l e d _ c o p y _ p o s t a c t _ r 2 s = e p i _ t e n s o r s _ l o o p . tiled_copy_postact_r2s ,
+tDrRowVec_epi = e p i _ t e n s o r s _ l o o p . tDrRowVec_epi ,
+)
+@cute . jit
+def c o n s u m e r _ s m e m _ s t o r e (
+self ,
+epi_coord : cute . Coord ,
+
+18
+
+335
+336
+337
+338
+339
+340
+341
+342
+343
+344
+345
+346
+347
+348
+349
+350
+351
+352
+353
+354
+355
+356
+357
+358
+359
+360
+361
+362
+363
+364
+365
+366
+367
+368
+369
+370
+371
+372
+373
+374
+375
+376
+377
+378
+379
+380
+381
+382
+383
+384
+385
+386
+387
+388
+389
+390
+391
+392
+393
+394
+395
+396
+397
+398
+399
+400
+401
+402
+403
+404
+405
+406
+407
+408
+409
+410
+411
+412
+413
+
+epi_buffer : cute . Int32 ,
+epi_params : EpilogueParams ,
+e p i _ t e n s o r s _ l o o p : EpilogueTensorsLoop ,
+) -> None :
+tiled_copy = e p i _ t e n s o r s _ l o o p . t i l e d _ c o p y _ p o s t a c t _ r 2 s
+tRS_rPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ l o o p . tRS_rPostAct )
+tRS_sPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ l o o p . tRS_sPostAct )
+src = tiled_copy . retile ( tRS_rPostAct )
+dst = tRS_sPostAct [ None , None , None , epi_buffer ]
+cute . copy ( atom = tiled_copy , src = src , dst = dst )
+@cute . jit
+def c o n s u m e r _ t m a _ s t o r e (
+self ,
+epi_coord : cute . Coord ,
+epi_buffer : cute . Int32 ,
+epi_params : EpilogueParams ,
+e p i _ t e n s o r s _ l o o p : EpilogueTensorsLoop ,
+) -> None :
+atom = e p i _ t e n s o r s _ l o o p . epi_tma_atom
+tDsPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ l o o p . tDsPostAct )
+tDgPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( e p i _ t e n s o r s _ l o o p . tDgPostAct )
+src = tDsPostAct [ None , epi_buffer ]
+dst = tDgPostAct [ None , epi_coord ]
+cute . copy ( atom = atom , src = src , dst = dst )
+@cute . jit
+def g e t_ s me m_ s tr uc t (
+self ,
+ep i_load _stag e : int ,
+ep i _n um _ th re a ds : int ,
+epi_params : EpilogueParams ,
+) -> type [ E p i l o g u e S h a r e d S t o r a g e ]:
+if cutlass . const_expr ( epi_params . mPostAct is not None ) :
+p o s t _ a c t _ s m e m _ s i z e = cute . cosize ( epi_params . e p i _ s m e m _ l a y o u t _ s t a g e d )
+else :
+post_act_smem_size = 0
+if cutlass . const_expr ( epi_params . mRowVec is not None ) :
+mRowVec = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_params . mRowVec )
+row_vec_dtype = get_dtype ( mRowVec )
+r o w _ v e c _ s m e m _ s i z e = epil ogue_u tils . g e t _ s m e m _ s i z e _ v e c t o r (
+mTensor = mRowVec ,
+epi_tile = self . tile_s hape_ mnk [1] ,
+ep i_ n um _t h re a ds = epi_num_threads ,
+)
+else :
+row_vec_dtype = cute . Float32
+row_vec_smem_size = 0
+@cute . struct
+class SharedStorage ( E p i l o g u e S h a r e d S t o r a g e ) :
+sPostAct : cute . struct . Align [ cute . struct . MemRange [ self . container_dtype ,
+p o s t _ a c t _ s m e m _ s i z e ] , self . b u f f e r _ a l i g n _ b y t e s ]
+sRowVec : cute . struct . Align [ cute . struct . MemRange [ row_vec_dtype ,
+r o w _ v e c _ s m e m _ s i z e ] , 16]
+return SharedStorage
+@cute . jit
+def g e t _ s m e m _ t e n s o r s (
+self ,
+storage : EpilogueSharedStorage ,
+ep i _n um _ th re a ds : int ,
+epi_params : EpilogueParams ,
+) -> E p i l o g u e T e n s o r s S M e m :
+if cutlass . const_expr ( epi_params . mPostAct is not None ) :
+sPostAct = storage . sPostAct . get_tensor (
+epi_params . e p i _ s m e m _ l a y o u t _ s t a g e d . outer ,
+swizzle = epi_params . e p i _ s m e m _ l a y o u t _ s t a g e d . inner ,
+)
+else :
+sPostAct = None
+if cutlass . const_expr ( epi_params . mRowVec is not None ) :
+sRowV ec_lay out = cute . make_layout ( self . tile_ shape_ mnk [1])
+sRowVec = storage . sRowVec . get_tensor ( sR owVec_ layout )
+else :
+sRowVec = None
+
+19
+
+414
+415
+return self . E p i l o g u e T e n s o r s S M e m (
+416
+sPostAct = sPostAct ,
+417
+sRowVec = sRowVec ,
+418
+)
+419
+420
+@cute . jit
+421
+def g e t _ s m e m _ b y t e s _ p e r _ s t a g e (
+422
+self ,
+423
+epi_tile : cute . Tile ,
+424
+ep i _n um _ th re a ds : int ,
+425
+epi_args : EpilogueArguments ,
+426
+) -> tuple [ int , int , int ]:
+427
+epi_smem_bytes_fixed = 0
+428
+epi_smem_bytes_per_stage_cst = 0
+429
+epi_smem_bytes_per_stage_pld = 0
+430
+431
+if cutlass . const_expr ( epi_args . mPostAct is not None ) :
+432
+mPostAct = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_args . mPostAct )
+433
+misc_utils . static_assert ( get_dtype ( mPostAct ) is self . co n ta in e r_ dt y pe )
+434
+epi_smem_bytes_per_stage_cst = epi_smem_bytes_per_stage_cst + (
+435
+epi logue_ utils . g e t _ e p i _ s m e m _ b y t e s _ p e r _ s t a g e _ m a t r i x (
+436
+mTensor = mPostAct ,
+437
+epi_tile = epi_tile ,
+438
+)
+439
+)
+440
+441
+if cutlass . const_expr ( epi_args . mRowVec is not None ) :
+442
+mRowVec = misc_utils . s t a t i c _ a s s e r t _ i s _ T e n s o r ( epi_args . mRowVec )
+443
+epi_smem_bytes_fixed = epi_smem_bytes_fixed + (
+444
+epi logue_ utils . g e t _ e p i _ s m e m _ b y t e s _ p e r _ s t a g e _ f i x e d _ v e c t o r (
+445
+mTensor = mRowVec ,
+446
+epi_tile = self . til e_shap e_mnk [1] ,
+447
+e pi _n u m_ th r ea d s = epi_num_threads ,
+448
+)
+449
+)
+450
+451
+return (
+452
+epi_smem_bytes_fixed ,
+453
+epi_s mem_by tes_pe r_stag e_cst ,
+454
+epi_s mem_by tes_pe r_stag e_pld ,
+455
+)
+456
+457
+458 def p r e p a r e _ e p i l o g u e (
+459
+shape_mnkl : tuple [ int , int , int , int ] ,
+460
+tile_shape_mn : tuple [ int , int ] ,
+461
+C : torch . Tensor ,
+462
+S : torch . Tensor ,
+463
+W : torch . Tensor ,
+464
+O : torch . Tensor ,
+465 ) -> tuple [
+466
+Callable [... , E p i l o g u e V i s i t o r T r e e ] ,
+467
+E p i l o g u e V i s i t o r T r e e . EpilogueArguments ,
+468
+dict ,
+469
+tuple ,
+470 ]:
+471
+" " " Prepare epilogue for GEMM with residual , partial mean - of - squares , and
+472
+fused per - N RMSNorm - weight scaling - mirrors trainstation ’s ‘ gemm_partial_rms_fwd ‘.
+473
+474
+Composes three EVT visitors :
+475
+1. EVTResidual : D = acc + C
+476
+2. E V T C o l B l o c k R e d u c t i o n S t o r e : S [m , nb ] = mean ( D [m , nb * bs :( nb +1) * bs ]^2)
+477
+3. E V T R o w V e c M u l P o s t A c t ( local ) : O [m , n ] = D [m , n ] * W [ n ] , side output via TMA
+478
+479
+The partial sum - of - squares is computed on the * unscaled * D , so a downstream
+480
+rstd reduction sees the GEMM output before W is applied . tRS_rD is preserved
+481
+so the main D output is also unscaled .
+482
+483
+Args :
+484
+shape_mnkl : Problem shape (M , N , K , L ) where L is batch dimension .
+485
+tile_shape_mn : CTA tile shape ( tile_M , tile_N ) .
+486
+C : Residual matrix of shape (M , N ) .
+487
+S : Output for partial mean - of - squares of shape (M , num_blocks ) in fp32 .
+488
+W : RMSNorm weight of shape (N ,) , broadcast across M .
+489
+O : Output of shape (M , N ) for D * W .
+490
+491
+Returns :
+492
+Tuple of ( epi_cls , epi_args , epi_outs , epi_keys ) .
+493
+"""
+494
+M , N , K , L = shape_mnkl
+
+20
+
+495
+496
+497
+498
+499
+500
+501
+502
+503
+504
+505
+506
+507
+508
+509
+510
+511
+512
+513
+514
+515
+516
+517
+518
+519
+520
+521
+522
+523
+524
+525
+526
+527
+528
+529
+530
+531
+532
+533
+534
+535
+536
+537
+538
+539
+540
+541
+542
+543
+544
+545
+546
+
+epi_dtype = t o r c h 2 c u t e _ d t y p e _ m a p [ C . dtype ]
+post _act_d type = t o r c h 2 c u t e _ d t y p e _ m a p [ O . dtype ]
+epi_cls = lambda acc_dtype , tile_shape_mnk , b u f f e r _ a l i g n _ b y t e s : EVTList ([
+EVTResidual (
+acc_dtype = acc_dtype ,
+epi_dtype = epi_dtype ,
+tile_ shape_ mnk = tile_shape_mnk ,
+b u f f e r _ a l i g n _ b y t e s = buffer_align_bytes ,
+),
+EVTColBlockReductionStore (
+reduction_op = _ c r e a t e _ m e a n _ s q _ r e d u c t i o n _ o p (
+element_type = acc_dtype ,
+inv _block _size =1.0 / tile_s hape_m nk [1] ,
+),
+tile_ shape_ mnk = tile_shape_mnk ,
+),
+EVTRowVecMulPostAct (
+acc_dtype = acc_dtype ,
+post_ act_dt ype = post_act_dtype ,
+tile_ shape_ mnk = tile_shape_mnk ,
+b u f f e r _ a l i g n _ b y t e s = buffer_align_bytes ,
+),
+])
+epi_args = EVTList . E p i l o g u e A r g u m e n t s ([
+EVTResidual . E p i l o g u e A r g u m e n t s (
+mMatrix =C ,
+),
+EVTColBlockReductionStore . EpilogueArguments (
+mColVec =S ,
+),
+EVTRowVecMulPostAct . EpilogueArguments (
+mPostAct =O ,
+mRowVec =W ,
+),
+])
+epi_keys = (
+C . dtype ,
+S . dtype ,
+W . dtype ,
+O . dtype ,
+EVTResidual ,
+EVTColBlockReductionStore ,
+EVTRowVecMulPostAct ,
+)
+epi_outs = {}
+return epi_cls , epi_args , epi_outs , epi_keys
+
+Listing 2: Kernel Example.
+
+C
+
+Experiments
+
+C.1
+
+List of Kernels
+
+We summarize the kernels implemented in CODA. Each kernel is a GEMM followed by an epilogue
+program.
+C.1.1
+
+Basic Epilogue Kernels
+
+We first list three basic GEMM-plus-epilogue kernels. These are useful for isolating individual
+epilogue primitives, although they are not always used directly in the Transformer forward pass.
+Kernel 1: GEMM with RoPE. This kernel applies RoPE [15] to pairs of adjacent features in the
+GEMM output:
+D = AB,
+O = RoPE(D).
+21
+
+Kernel 2: GEMM with SwiGLU. This kernel applies a fused SwiGLU activation to an interleaved
+GEMM output:
+D = AB,
+[G, U ] = interleavedSplit(D),
+O = silu(G) ⊙ U .
+Kernel 3: GEMM with partial cross-entropy. This kernel computes logits, selects the target logit,
+and emits block-wise log-sum-exp statistics for the cross-entropy loss:
+Z = AB,
+ztgt = Z[y],
+lblse = reduceTilelog P exp (Z).
+C.1.2
+
+Forward-Pass Kernels
+
+The following kernels implement the reparameterized Transformer forward pass. They compose the
+basic epilogue primitives with RMSNorm scaling, residual updates, and partial reductions.
+Kernel 4: GEMM with residual, partial RMSNorm, and weight scaling. This kernel implements
+the first stage of the GEMM–Residual–RMSNorm–GEMM pattern. It forms the residual-updated
+activation, emits partial RMS statistics, and applies the RMSNorm weight:
+D = AB + C,
+rb = reduceTilecols (D ⊙ D),
+O = D ⊙ γ.
+Kernel 5: GEMM with RMSNorm scaling. This kernel consumes a precomputed row-wise
+normalization factor and applies it in the GEMM epilogue:
+D = AB,
+O = D ⊙ r.
+Kernel 6: GEMM with RMSNorm and SwiGLU. This kernel composes row-wise RMSNorm
+scaling with SwiGLU, corresponding to the MLP gate/up projection:
+D = AB,
+D ′ = D ⊙ r,
+[G, U ] = interleavedSplit(D ′ ),
+O = silu(G) ⊙ U .
+Kernel 7: GEMM with RMSNorm and RoPE. This kernel composes row-wise RMSNorm scaling
+with RoPE, corresponding to QKV projection followed by rotary positional embedding:
+D = AB,
+D ′ = D ⊙ r,
+O = RoPE(D ′ ).
+Kernel 8: GEMM with RMSNorm and partial cross-entropy. This kernel adds row-wise RMSNorm scaling before target-logit selection and partial log-sum-exp reduction, corresponding to the
+language-modeling head:
+Z = (AB) ⊙ r,
+ztgt = Z[y],
+b
+llse = reduceTilelog P exp (Z).
+22
+
+C.1.3
+
+Backward-Pass Kernels
+
+Finally, we list the backward kernels. These kernels mirror the forward structure: each performs
+a GEMM, applies the local backward rule in the epilogue, and emits partial reductions needed by
+neighboring RMSNorm backward computations.
+Kernel 9: GEMM with residual and RMSNorm backward. This kernel implements the local part
+of RMSNorm backward. Let C denote the RMSNorm input, r the row-wise inverse RMS factor, γ
+the RMSNorm weight, and z∆z the row-wise RMSNorm backward statistic:
+D = AB ⊤ ,
+Cnorm = C ⊙ r,
+Oout = Oin + (D ⊙ γ − Cnorm ⊙ z∆z ) ⊙ r,
+Cout = Cnorm ⊙ γ,
+[
+∇
+γ L = reduceTilerows (D ⊙ Cnorm ) .
+Kernel 10: GEMM with SwiGLU backward. This kernel computes the backward pass of a fused
+SwiGLU epilogue and emits the row-wise statistic needed by the preceding RMSNorm backward.
+Let Z be the saved interleaved pre-activation tensor:
+D = AB ⊤ ,
+[G, U ] = interleavedSplit(Z),
+O = silu(G) ⊙ U ,
+∇U L = D ⊙ silu(G),
+∇G L = D ⊙ U ⊙ (σ(G) + silu(G) ⊙ (1 − σ(G))) ,
+∇Z L = interleavedConcat (∇G L, ∇U L) ,
+zd
+∆z = reduceTilecols (G ⊙ ∇G L + U ⊙ ∇U L) .
+C.2
+
+Setup Details
+
+Experiments are conducted using a single H100 GPU. We use the following package versions.
+1. PyTorch 2.10.0
+2. CuTeDSL 4.4.2
+3. Liger Kernels 0.8.0
+4. FlashInfer 0.6.10.post1
+5. QuACK Kernels 0.4.1
+
+23
+
+

@@ -19,25 +19,47 @@ esac
 
 FINEWEB_VARIANT="${FINEWEB_VARIANT:-edu}"
 case "$FINEWEB_VARIANT" in
-  edu|fineweb-edu|fineweb_edu)
-    DEFAULT_FINEWEB_DATASET="HuggingFaceFW/fineweb-edu"
+  edu|fineweb-edu|fineweb_edu|fineweb-edu-dedup|fineweb_edu_dedup|dedup|smollm)
+    DEFAULT_FINEWEB_DATASET="HuggingFaceTB/smollm-corpus"
+    DEFAULT_FINEWEB_CONFIG="fineweb-edu-dedup"
     ;;
   web|fineweb)
     DEFAULT_FINEWEB_DATASET="HuggingFaceFW/fineweb"
+    DEFAULT_FINEWEB_CONFIG="sample-10BT"
     ;;
   *)
-    echo "Unknown FINEWEB_VARIANT=$FINEWEB_VARIANT; expected edu or web." >&2
+    echo "Unknown FINEWEB_VARIANT=$FINEWEB_VARIANT; expected edu, fineweb-edu-dedup, or web." >&2
     exit 2
     ;;
 esac
 
 FINEWEB_DATASET="${FINEWEB_DATASET:-$DEFAULT_FINEWEB_DATASET}"
-if [[ -z "${FINEWEB_DATASET_SLUG:-}" ]]; then
+if [[ -z "${FINEWEB_CONFIG:-}" ]]; then
   case "$FINEWEB_DATASET" in
-    HuggingFaceFW/fineweb-edu)
+    HuggingFaceTB/smollm-corpus)
+      FINEWEB_CONFIG="$DEFAULT_FINEWEB_CONFIG"
+      ;;
+    HuggingFaceFW/fineweb-edu|HuggingFaceFW/fineweb)
+      FINEWEB_CONFIG="sample-10BT"
+      ;;
+    *)
+      FINEWEB_CONFIG="$DEFAULT_FINEWEB_CONFIG"
+      ;;
+  esac
+fi
+if [[ -z "${FINEWEB_DATASET_SLUG:-}" ]]; then
+  case "$FINEWEB_DATASET:$FINEWEB_CONFIG" in
+    HuggingFaceTB/smollm-corpus:fineweb-edu-dedup)
+      FINEWEB_DATASET_SLUG="fineweb_edu_dedup"
+      ;;
+    HuggingFaceTB/smollm-corpus:*)
+      FINEWEB_DATASET_SLUG="$FINEWEB_CONFIG"
+      FINEWEB_DATASET_SLUG="${FINEWEB_DATASET_SLUG//[^[:alnum:]_]/_}"
+      ;;
+    HuggingFaceFW/fineweb-edu:*)
       FINEWEB_DATASET_SLUG="fineweb_edu"
       ;;
-    HuggingFaceFW/fineweb)
+    HuggingFaceFW/fineweb:*)
       FINEWEB_DATASET_SLUG="fineweb"
       ;;
     *)
@@ -48,7 +70,6 @@ if [[ -z "${FINEWEB_DATASET_SLUG:-}" ]]; then
 fi
 
 RUN_NAME="${RUN_NAME:-d${DEPTH}_${FINEWEB_DATASET_SLUG}_tpp20}"
-FINEWEB_CONFIG="${FINEWEB_CONFIG:-sample-10BT}"
 FINEWEB_SPLIT="${FINEWEB_SPLIT:-train}"
 FINEWEB_DOCS="${FINEWEB_DOCS:-$DEFAULT_FINEWEB_DOCS}"
 VOCAB_SIZE="${VOCAB_SIZE:-32768}"
