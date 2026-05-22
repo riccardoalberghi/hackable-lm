@@ -16,6 +16,7 @@ data/
 eval_data/
 runs/
 mlruns/
+tmp/
 
 *.pt
 *.pth
