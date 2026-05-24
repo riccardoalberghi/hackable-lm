@@ -173,6 +173,11 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.head_dim = config.head_dim
+        assert (
+            self.n_kv_head > 0
+            and self.n_kv_head <= self.n_head
+            and self.n_head % self.n_kv_head == 0
+        ), "n_kv_head must be positive, no greater than n_head, and divide n_head"
         self.attention_window = layer_attention_window(layer_idx, config.n_layer, config.attention_window, config.attention_full_every)
         self.dropout = config.dropout
         self.q_dim = config.n_head * config.head_dim
