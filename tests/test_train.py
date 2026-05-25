@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import copy
+
+import pytest
+
 from conftest import requires_torch
 
 
@@ -82,6 +86,95 @@ def test_next_train_batch_reuses_fixed_batch_without_advancing_prefetcher() -> N
     assert next_train_batch(prefetcher, fixed) == fixed
     assert prefetcher.calls == 0
     assert next_train_batch(prefetcher, None, prepare_next=False) == ("fresh", 1, False)
+
+
+@requires_torch
+def test_checkpoint_steps_stop_prefetch_after_last_microbatch() -> None:
+    from train import should_prepare_next_train_batch
+
+    assert should_prepare_next_train_batch(2, 0, 5, 2, checkpoint_this_step=True) is True
+    assert should_prepare_next_train_batch(2, 1, 5, 2, checkpoint_this_step=True) is False
+    assert should_prepare_next_train_batch(2, 1, 5, 2, checkpoint_this_step=False) is True
+    assert should_prepare_next_train_batch(4, 1, 5, 2, checkpoint_this_step=False) is False
+
+
+@requires_torch
+def test_apply_warmdown_resume_target_updates_total_budget() -> None:
+    from train import apply_warmdown_resume_target, warmdown_target_steps_from_tpp
+
+    class Config:
+        def __init__(self) -> None:
+            self.num_iterations = 100
+            self.target_tokens = 0
+            self.scheduled_tokens = 0
+            self.train_flops_budget = 0.0
+            self.budget_policy = "fixed_steps"
+            self.warmup_ratio = 0.05
+            self.warmup_steps = 5
+            self.scaling_params = 100
+            self.global_batch_tokens = 64
+            self.estimated_flops_per_token = 10
+            self.lr_scheduler = "wsd"
+            self.extra = {}
+
+    class Args:
+        warmdown_to_target_tpp = 20.0
+        warmdown_to_target_steps = None
+
+    target_steps, target_tokens = warmdown_target_steps_from_tpp(20.0, Config())
+    assert (target_steps, target_tokens) == (32, 2000)
+
+    config = Config()
+    assert apply_warmdown_resume_target(config, start_step=20, args=Args) == 23
+    assert config.num_iterations == 32
+    assert config.warmup_steps == 2
+    assert config.target_tokens == 2000
+    assert config.scheduled_tokens == 32 * 64
+    assert config.train_flops_budget == 32 * 64 * 10
+    assert config.budget_policy == "warmdown_target_tokens_per_param"
+    assert config.extra["warmdown_resume"]["checkpoint_start_step"] == 20
+    assert config.extra["warmdown_resume"]["decay_start_step"] == 23
+
+    class StepArgs:
+        warmdown_to_target_tpp = None
+        warmdown_to_target_steps = 40
+
+    step_config = Config()
+    assert apply_warmdown_resume_target(step_config, start_step=20, args=StepArgs) == 28
+    assert step_config.num_iterations == 40
+    assert step_config.warmup_steps == 2
+    assert step_config.target_tokens == 40 * 64
+
+    with pytest.raises(ValueError, match="would start before the resumed checkpoint"):
+        apply_warmdown_resume_target(Config(), start_step=24, args=Args)
+
+    with pytest.raises(ValueError, match="after the resumed checkpoint"):
+        apply_warmdown_resume_target(Config(), start_step=40, args=StepArgs)
+
+
+@requires_torch
+def test_warmdown_compatibility_allows_budget_and_schedule_length_changes() -> None:
+    from train import warmdown_compatibility_warnings
+
+    source = {
+        "config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16", "target_tokens": 1600},
+        "lr_schedule": {"scheduler": "wsd", "warmup_steps": 5, "warmdown_ratio": 0.3, "final_lr_frac": 0.1},
+        "seed": 1,
+        "data": {"data_shuffle_seed": 7, "manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}}},
+    }
+    target = copy.deepcopy(source)
+    target["config"]["target_tokens"] = 800
+    target["lr_schedule"]["warmup_steps"] = 3
+
+    assert warmdown_compatibility_warnings(source, target) == []
+
+    changed_seed = copy.deepcopy(target)
+    changed_seed["seed"] = 2
+    assert warmdown_compatibility_warnings(source, changed_seed) == ["seed differs (seed)"]
+
+    changed_schedule = copy.deepcopy(target)
+    changed_schedule["lr_schedule"]["final_lr_frac"] = 0.2
+    assert "LR final lr frac differs for warmdown resume" in warmdown_compatibility_warnings(source, changed_schedule)
 
 
 @requires_torch

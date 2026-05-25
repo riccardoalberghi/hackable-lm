@@ -54,6 +54,14 @@ def test_preprocess_and_memmap(tmp_path: Path) -> None:
     assert torch.equal(x, same_x)
     assert torch.equal(y, same_y)
 
+    state = loader.state_dict()
+    next_x, next_y = loader.get_batch("train", 4, "cpu")
+    restored_loader = MemmapDataLoader(out, block_size=8, data_shuffle_seed=123)
+    restored_loader.load_state_dict(state)
+    restored_x, restored_y = restored_loader.get_batch("train", 4, "cpu")
+    assert torch.equal(next_x, restored_x)
+    assert torch.equal(next_y, restored_y)
+
     different_loader = MemmapDataLoader(out, block_size=8, data_shuffle_seed=456)
     different_x, different_y = different_loader.get_batch("train", 4, "cpu")
     assert not (torch.equal(x, different_x) and torch.equal(y, different_y))

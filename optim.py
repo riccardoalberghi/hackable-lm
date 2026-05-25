@@ -467,12 +467,20 @@ def lr_multiplier(
     warmdown_ratio: float,
     final_lr_frac: float,
     scheduler: str = "wsd",
+    decay_start_step: int | None = None,
 ) -> float:
     if scheduler != "wsd":
         raise ValueError(f"unsupported LR scheduler {scheduler!r}")
     warmup_steps = min(warmup_steps, num_iterations)
-    decay_iters = int(num_iterations * warmdown_ratio)
-    decay_start = max(warmup_steps, num_iterations - decay_iters)
+    if decay_start_step is None:
+        decay_iters = int(num_iterations * warmdown_ratio)
+        decay_start = max(warmup_steps, num_iterations - decay_iters)
+    else:
+        decay_start = int(decay_start_step)
+        if decay_start < warmup_steps:
+            raise ValueError(f"decay_start_step={decay_start} must be >= warmup_steps={warmup_steps}")
+        if decay_start > num_iterations:
+            raise ValueError(f"decay_start_step={decay_start} must be <= num_iterations={num_iterations}")
     if step < warmup_steps:
         return (step + 1) / warmup_steps
     if step < decay_start:
