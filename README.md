@@ -132,6 +132,39 @@ uv run python repro.py compare \
 capacity, `same_bytes` for tokenizer or preprocessing changes, and `same_flops`
 or `same_time` for efficiency claims.
 
+## WSD Warmdown Resumes
+
+For WSD schedules, shorter-budget runs can reuse any normal checkpoint from a
+longer run and continue to a requested total budget. The target budget defines
+the normal WSD warmdown boundary, so the resumed run stays on the plateau until
+that boundary and then decays:
+
+```bash
+uv run python train.py \
+  --depth 12 \
+  --data data/processed \
+  --resume runs/d12_10k/checkpoints/latest.pt \
+  --warmdown-to-target-steps 2000 \
+  --run-name d12_2k_from_long
+```
+
+For token-per-parameter budgets, use:
+
+```bash
+uv run python train.py \
+  --depth 12 \
+  --data data/processed \
+  --resume runs/d12_10k/checkpoints/latest.pt \
+  --warmdown-to-target-tpp 20 \
+  --run-name d12_20tpp_from_long
+```
+
+The checkpoint must resume at or before the target budget's WSD decay start; if
+the requested target would have started warmdown before the checkpoint, training
+exits with an error. The run ends at the requested total step or
+tokens-per-scaling-param budget, restores the data-loader cursor, and rejects
+unexpected provenance mismatches without needing `--allow-resume-mismatch`.
+
 ## Eval
 
 ```bash

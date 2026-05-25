@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import random
 import sys
@@ -237,6 +238,103 @@ def next_train_batch(prefetcher, fixed_batch, *, prepare_next: bool = True):
     return prefetcher.next(prepare_next=prepare_next)
 
 
+def should_prepare_next_train_batch(
+    step: int,
+    micro_step: int,
+    num_iterations: int,
+    gradient_accumulation_steps: int,
+    checkpoint_this_step: bool,
+) -> bool:
+    more_train_batches = step != num_iterations - 1 or micro_step != gradient_accumulation_steps - 1
+    if not more_train_batches:
+        return False
+    last_micro_step = micro_step == gradient_accumulation_steps - 1
+    return not (checkpoint_this_step and last_micro_step)
+
+
+def has_warmdown_resume_target(args) -> bool:
+    return args.warmdown_to_target_tpp is not None or args.warmdown_to_target_steps is not None
+
+
+def warmdown_target_steps_from_tpp(tokens_per_param: float, config) -> tuple[int, int]:
+    if tokens_per_param <= 0:
+        raise ValueError("--warmdown-to-target-tpp must be > 0")
+    target_tokens = math.ceil(tokens_per_param * config.scaling_params)
+    target_steps = math.ceil(target_tokens / config.global_batch_tokens)
+    return target_steps, target_tokens
+
+
+def warmup_steps_for_num_iterations(num_iterations: int, warmup_ratio: float) -> int:
+    return max(1, round(warmup_ratio * num_iterations)) if num_iterations > 0 else 0
+
+
+def wsd_decay_start_step(num_iterations: int, warmup_steps: int, warmdown_ratio: float, scheduler: str) -> int:
+    if scheduler != "wsd":
+        raise ValueError(f"warmdown resume requires the WSD scheduler, got {scheduler!r}")
+    warmup_steps = min(warmup_steps, num_iterations)
+    decay_iters = int(num_iterations * warmdown_ratio)
+    return max(warmup_steps, num_iterations - decay_iters)
+
+
+def apply_warmdown_resume_target(config, start_step: int, args) -> int | None:
+    if not has_warmdown_resume_target(args):
+        return None
+    if args.warmdown_to_target_tpp is not None and args.warmdown_to_target_steps is not None:
+        raise ValueError("choose only one warmdown target: --warmdown-to-target-tpp or --warmdown-to-target-steps")
+    if config.lr_scheduler != "wsd":
+        raise ValueError(f"warmdown resume requires the WSD scheduler, got {config.lr_scheduler!r}")
+
+    if args.warmdown_to_target_steps is not None:
+        target_steps = int(args.warmdown_to_target_steps)
+        if target_steps <= 0:
+            raise ValueError("--warmdown-to-target-steps must be > 0")
+        requested_target_tokens = target_steps * config.global_batch_tokens
+        target_kind = "steps"
+        target_value = target_steps
+    else:
+        target_steps, requested_target_tokens = warmdown_target_steps_from_tpp(args.warmdown_to_target_tpp, config)
+        target_kind = "tokens_per_param"
+        target_value = args.warmdown_to_target_tpp
+
+    if target_steps <= start_step:
+        raise ValueError(
+            "warmdown target must be after the resumed checkpoint: "
+            f"checkpoint resumes at step {start_step}, target_steps={target_steps}"
+        )
+
+    original_warmup_steps = config.warmup_steps
+    target_warmup_steps = warmup_steps_for_num_iterations(target_steps, config.warmup_ratio)
+    target_decay_start = wsd_decay_start_step(
+        target_steps,
+        target_warmup_steps,
+        config.warmdown_ratio,
+        config.lr_scheduler,
+    )
+    if target_decay_start < start_step:
+        raise ValueError(
+            "warmdown for the target budget would start before the resumed checkpoint: "
+            f"checkpoint resumes at step {start_step}, target decay starts at step {target_decay_start}"
+        )
+
+    config.num_iterations = target_steps
+    config.warmup_steps = target_warmup_steps
+    config.target_tokens = int(requested_target_tokens)
+    config.scheduled_tokens = target_steps * config.global_batch_tokens
+    config.train_flops_budget = float(config.estimated_flops_per_token * config.scheduled_tokens)
+    config.budget_policy = f"warmdown_target_{target_kind}"
+    config.extra["warmdown_resume"] = {
+        "enabled": True,
+        "checkpoint_start_step": start_step,
+        "decay_start_step": target_decay_start,
+        "original_warmup_steps": original_warmup_steps,
+        "target_kind": target_kind,
+        "target_value": target_value,
+        "target_steps": target_steps,
+        "requested_target_tokens": int(requested_target_tokens),
+    }
+    return target_decay_start
+
+
 @torch.no_grad()
 def grad_global_norm(parameters: list[torch.nn.Parameter], norm_type: float = 2.0) -> torch.Tensor:
     grads = [p.grad for p in parameters if p.grad is not None]
@@ -363,7 +461,102 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
             args.tokens_per_second = cfg.get("tokens_per_second")
 
 
-def save_checkpoint(path: Path, raw_model, optimizer, config, manifest, step: int, tokens_seen: int) -> None:
+WARMDOWN_ALLOWED_RESUME_MISMATCH_FIELDS = {
+    "lr_schedule",
+    "config.target_tokens",
+    "config.target_bytes",
+    "config.train_flops_budget",
+    "config.target_time_seconds",
+}
+
+
+def _warning_field(warning: str) -> str | None:
+    if not warning.endswith(")"):
+        return None
+    marker = " ("
+    if marker not in warning:
+        return None
+    return warning.rsplit(marker, 1)[1][:-1]
+
+
+def _lr_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    schedule = manifest.get("lr_schedule") or {}
+    config = manifest.get("config") or {}
+    return {
+        "scheduler": schedule.get("scheduler", config.get("lr_scheduler")),
+        "warmdown_ratio": schedule.get("warmdown_ratio", config.get("warmdown_ratio")),
+        "final_lr_frac": schedule.get("final_lr_frac", config.get("final_lr_frac")),
+    }
+
+
+def warmdown_compatibility_warnings(source_manifest: dict[str, Any], target_manifest: dict[str, Any]) -> list[str]:
+    warnings = []
+    for warning in compatibility_warnings(source_manifest, target_manifest):
+        field = _warning_field(warning)
+        if field in WARMDOWN_ALLOWED_RESUME_MISMATCH_FIELDS:
+            continue
+        if warning.startswith("comparison mode differs"):
+            continue
+        warnings.append(warning)
+
+    source_schedule = _lr_schedule_from_manifest(source_manifest)
+    target_schedule = _lr_schedule_from_manifest(target_manifest)
+    for field in ("scheduler", "warmdown_ratio", "final_lr_frac"):
+        if source_schedule.get(field) != target_schedule.get(field):
+            warnings.append(f"LR {field.replace('_', ' ')} differs for warmdown resume")
+    return warnings
+
+
+def checkpoint_data_loader_state(loader: MemmapDataLoader, ddp: dict[str, int | bool]) -> dict[str, Any] | None:
+    local_state = loader.state_dict()
+    if not ddp["enabled"]:
+        return {
+            "version": 1,
+            "world_size": 1,
+            "rank_states": [local_state],
+        }
+    rank = int(ddp["rank"])
+    world_size = int(ddp["world_size"])
+    gathered = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_state, gathered, dst=0)
+    if rank != 0:
+        return None
+    return {
+        "version": 1,
+        "world_size": world_size,
+        "rank_states": gathered,
+    }
+
+
+def restore_data_loader_state(loader: MemmapDataLoader, ckpt: dict[str, Any], ddp: dict[str, int | bool]) -> None:
+    state = ckpt.get("data_loader_state")
+    if state is None:
+        raise RuntimeError("checkpoint is missing data_loader_state; old checkpoints cannot restore data order exactly")
+    if state.get("version") != 1:
+        raise RuntimeError(f"unsupported checkpoint data_loader_state version: {state.get('version')!r}")
+    world_size = int(ddp["world_size"])
+    if state.get("world_size") != world_size:
+        raise RuntimeError(
+            f"checkpoint was saved with world_size={state.get('world_size')}, "
+            f"but this run has world_size={world_size}"
+        )
+    rank_states = state.get("rank_states")
+    rank = int(ddp["rank"])
+    if not isinstance(rank_states, list) or rank >= len(rank_states):
+        raise RuntimeError("checkpoint data_loader_state does not contain this rank")
+    loader.load_state_dict(rank_states[rank])
+
+
+def save_checkpoint(
+    path: Path,
+    raw_model,
+    optimizer,
+    config,
+    manifest,
+    step: int,
+    tokens_seen: int,
+    data_loader_state: dict[str, Any],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -374,6 +567,7 @@ def save_checkpoint(path: Path, raw_model, optimizer, config, manifest, step: in
             "step": step,
             "tokens_seen": tokens_seen,
             "rng_state": rng_state(),
+            "data_loader_state": data_loader_state,
         },
         path,
     )
@@ -405,6 +599,18 @@ def main() -> None:
     parser.add_argument("--match-run")
     parser.add_argument("--candidate-label")
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--warmdown-to-target-tpp",
+        "--warmdown-to-target-tokens-per-param",
+        dest="warmdown_to_target_tpp",
+        type=float,
+        help="with --resume, continue to this total tokens-per-scaling-param budget using that target run's WSD warmdown boundary",
+    )
+    parser.add_argument(
+        "--warmdown-to-target-steps",
+        type=int,
+        help="with --resume, continue to this total training-step budget using that target run's WSD warmdown boundary",
+    )
     parser.add_argument("--allow-resume-mismatch", action="store_true", help="resume even if checkpoint provenance differs from requested run settings")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--val-interval", type=int, default=100)
@@ -431,6 +637,10 @@ def main() -> None:
         help="debug sanity check: repeatedly train on the first sampled training batch",
     )
     args = parser.parse_args()
+    if has_warmdown_resume_target(args) and not args.resume:
+        parser.error("--warmdown-to-target-tpp/steps require --resume")
+    if args.warmdown_to_target_tpp is not None and args.warmdown_to_target_steps is not None:
+        parser.error("choose only one warmdown target: --warmdown-to-target-tpp or --warmdown-to-target-steps")
 
     matched_manifest = load_run_manifest_arg(args.match_run) if args.match_run else None
     if matched_manifest:
@@ -526,12 +736,24 @@ def main() -> None:
     start_step = 0
     tokens_seen = 0
     resume_ckpt = None
-    if args.resume:
-        resume_ckpt = load_trusted_checkpoint(args.resume, map_location="cpu")
+    warmdown_decay_start_step = None
+    checkpoint_path = args.resume
+    if checkpoint_path:
+        resume_ckpt = load_trusted_checkpoint(checkpoint_path, map_location="cpu")
         if resume_ckpt["config"]["model"] != config.to_dict()["model"]:
             raise RuntimeError("checkpoint model config does not match requested config")
         start_step = resume_ckpt["step"] + 1
         tokens_seen = resume_ckpt["tokens_seen"]
+        try:
+            warmdown_decay_start_step = apply_warmdown_resume_target(config, start_step, args)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if warmdown_decay_start_step is not None and tokens_seen != start_step * config.global_batch_tokens:
+            raise RuntimeError(
+                "warmdown resume checkpoint token count does not match this run's global batch size: "
+                f"tokens_seen={tokens_seen}, expected {start_step * config.global_batch_tokens}"
+            )
+        restore_data_loader_state(loader, resume_ckpt, ddp)
     require_scheduled_data(loader, config, args, start_step, validate_rank=is_main)
 
     raw_model = LanguageModel(config.model).to(device)
@@ -563,17 +785,22 @@ def main() -> None:
         dist.broadcast_object_list(manifest_box, src=0)
         manifest = manifest_box[0]
     mlflow = _start_mlflow(args, run_dir, manifest) if is_main else None
-    if args.resume:
+    if checkpoint_path:
         ckpt = resume_ckpt
         if ckpt is None:
             raise RuntimeError("resume checkpoint was not loaded")
         resume_manifest = ckpt.get("run_manifest")
         if resume_manifest:
-            resume_warnings = compatibility_warnings(resume_manifest, manifest)
+            resume_warnings = (
+                warmdown_compatibility_warnings(resume_manifest, manifest)
+                if has_warmdown_resume_target(args)
+                else compatibility_warnings(resume_manifest, manifest)
+            )
             if resume_warnings and not args.allow_resume_mismatch:
                 formatted = "\n".join(f"- {warning}" for warning in resume_warnings)
+                resume_kind = "warmdown resume checkpoint" if has_warmdown_resume_target(args) else "checkpoint"
                 raise RuntimeError(
-                    "checkpoint provenance does not match requested resume settings:\n"
+                    f"{resume_kind} provenance does not match requested resume settings:\n"
                     f"{formatted}\n"
                     "Pass --allow-resume-mismatch only for an intentional non-paper resume."
                 )
@@ -596,6 +823,8 @@ def main() -> None:
     try:
         for step in range(start_step, config.num_iterations):
             log_this_step = is_main and (step % args.log_interval == 0 or step == config.num_iterations - 1)
+            periodic_checkpoint_this_step = step % args.checkpoint_interval == 0 and step != start_step
+            checkpoint_this_step = periodic_checkpoint_this_step
             mark_compiled_step_begin(config.compile)
             optimizer.zero_grad(set_to_none=True)
             total_loss = None
@@ -607,8 +836,14 @@ def main() -> None:
                     else model.no_sync()
                 )
                 with sync_context:
-                    more_train_batches = step != config.num_iterations - 1 or micro_step != config.gradient_accumulation_steps - 1
-                    x, y = next_train_batch(train_prefetcher, fixed_train_batch, prepare_next=more_train_batches)
+                    prepare_next = should_prepare_next_train_batch(
+                        step,
+                        micro_step,
+                        config.num_iterations,
+                        config.gradient_accumulation_steps,
+                        checkpoint_this_step,
+                    )
+                    x, y = next_train_batch(train_prefetcher, fixed_train_batch, prepare_next=prepare_next)
                     _, loss = model(x, y)
                     (loss / config.gradient_accumulation_steps).backward()
                     if log_this_step:
@@ -618,7 +853,15 @@ def main() -> None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, args.max_grad_norm, foreach=True)
             elif log_this_step:
                 grad_norm = grad_global_norm(clip_params)
-            lr_mult = lr_multiplier(step, config.num_iterations, config.warmup_steps, config.warmdown_ratio, config.final_lr_frac, config.lr_scheduler)
+            lr_mult = lr_multiplier(
+                step,
+                config.num_iterations,
+                config.warmup_steps,
+                config.warmdown_ratio,
+                config.final_lr_frac,
+                config.lr_scheduler,
+                decay_start_step=warmdown_decay_start_step,
+            )
             optimizer.set_lr_multiplier(lr_mult)
             optimizer.step()
             tokens_seen += config.global_batch_tokens
@@ -675,16 +918,43 @@ def main() -> None:
                     tokens_sec_samples.append(tokens_sec)
                 if mlflow is not None:
                     _log_mlflow_metrics(mlflow, record, step=step)
-            if is_main and step % args.checkpoint_interval == 0 and step != start_step:
-                save_checkpoint(run_dir / "checkpoints" / "latest.pt", raw_model, optimizer, config, manifest, step, tokens_seen)
-                if mlflow is not None:
-                    mlflow.log_artifact(str(run_dir / "checkpoints" / "latest.pt"), artifact_path="checkpoints")
+            if checkpoint_this_step:
+                data_loader_state = checkpoint_data_loader_state(loader, ddp)
+                if is_main:
+                    if data_loader_state is None:
+                        raise RuntimeError("main rank did not receive checkpoint data loader state")
+                    save_checkpoint(
+                        run_dir / "checkpoints" / "latest.pt",
+                        raw_model,
+                        optimizer,
+                        config,
+                        manifest,
+                        step,
+                        tokens_seen,
+                        data_loader_state,
+                    )
+                    if mlflow is not None:
+                        mlflow.log_artifact(str(run_dir / "checkpoints" / "latest.pt"), artifact_path="checkpoints")
+                if fixed_train_batch is None and step != config.num_iterations - 1:
+                    train_prefetcher.prepare_next()
 
+        data_loader_state = checkpoint_data_loader_state(loader, ddp)
         if ddp["enabled"]:
             dist.barrier()
         if not is_main:
             return
-        save_checkpoint(run_dir / "checkpoints" / "latest.pt", raw_model, optimizer, config, manifest, config.num_iterations - 1, tokens_seen)
+        if data_loader_state is None:
+            raise RuntimeError("main rank did not receive final data loader state")
+        save_checkpoint(
+            run_dir / "checkpoints" / "latest.pt",
+            raw_model,
+            optimizer,
+            config,
+            manifest,
+            config.num_iterations - 1,
+            tokens_seen,
+            data_loader_state,
+        )
         elapsed = time.perf_counter() - train_start_time
         avg_tokens_sec = sum(tokens_sec_samples) / len(tokens_sec_samples) if tokens_sec_samples else None
         final = {

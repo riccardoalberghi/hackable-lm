@@ -27,6 +27,9 @@ def test_schedules() -> None:
     assert 0 < lr_multiplier(0, 100, 10, 0.3, 0.1) <= 1
     assert lr_multiplier(20, 100, 10, 0.3, 0.1) == 1.0
     assert lr_multiplier(99, 100, 10, 0.3, 0.1) == 0.1
+    assert lr_multiplier(50, 100, 10, 0.3, 0.1, decay_start_step=50) == 1.0
+    assert lr_multiplier(99, 100, 10, 0.3, 0.1, decay_start_step=50) == 0.1
+    assert lr_multiplier(1, 2, 1, 0.3, 0.1, decay_start_step=2) == 1.0
 
 
 @requires_torch

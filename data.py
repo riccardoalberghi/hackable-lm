@@ -13,6 +13,7 @@ from tokenizer import BOS_TOKEN, load_tokenizer
 
 
 DTYPES = {"uint16": np.uint16, "uint32": np.uint32}
+DATA_LOADER_STATE_VERSION = 1
 
 
 def load_manifest(data_dir: str | Path) -> dict[str, Any]:
@@ -115,6 +116,40 @@ class MemmapDataLoader:
                 f"but the run requires {required_spans} spans ({batches} batches)."
             )
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": DATA_LOADER_STATE_VERSION,
+            "block_size": self.block_size,
+            "data_shuffle_seed": self.data_shuffle_seed,
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "doc_positions": {split: int(position) for split, position in self.doc_positions.items()},
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state.get("version") != DATA_LOADER_STATE_VERSION:
+            raise RuntimeError(f"unsupported data loader state version: {state.get('version')!r}")
+        expected = {
+            "block_size": self.block_size,
+            "data_shuffle_seed": self.data_shuffle_seed,
+            "rank": self.rank,
+            "world_size": self.world_size,
+        }
+        mismatches = [name for name, value in expected.items() if state.get(name) != value]
+        if mismatches:
+            details = ", ".join(f"{name}={state.get(name)!r} expected {expected[name]!r}" for name in mismatches)
+            raise RuntimeError(f"data loader state does not match this loader: {details}")
+        positions = state.get("doc_positions")
+        if not isinstance(positions, dict):
+            raise RuntimeError("data loader state is missing doc_positions")
+        if set(positions) != set(self.doc_positions):
+            raise RuntimeError("data loader state splits do not match this loader")
+        for split, position in positions.items():
+            position = int(position)
+            if position < 0:
+                raise RuntimeError(f"invalid negative data loader position for split {split!r}: {position}")
+            self.doc_positions[split] = position
+
     def _new_batch_buffer(self, batch_size: int, pin_memory: bool) -> torch.Tensor:
         return torch.empty((2, batch_size, self.block_size), dtype=torch.long, pin_memory=pin_memory)
 
@@ -206,6 +241,7 @@ class CudaBatchPrefetcher:
         self.copy_recorded = [False, False]
         self.pending_idx: int | None = None
         self.current_idx: int | None = None
+        self.fill_in_flight = False
         self.fill_requests: queue.Queue[int | None] = queue.Queue(maxsize=1)
         self.ready_slots: queue.Queue[tuple[int, BaseException | None]] = queue.Queue(maxsize=1)
         self.producer = threading.Thread(target=self._producer_loop, daemon=True)
@@ -238,10 +274,21 @@ class CudaBatchPrefetcher:
                 self.ready_slots.put((idx, None))
 
     def _start_cpu_fill(self, idx: int) -> None:
+        if self.fill_in_flight:
+            raise RuntimeError("cannot prepare a new CUDA batch while another fill is in flight")
+        self.fill_in_flight = True
         self.fill_requests.put(idx)
+
+    def prepare_next(self) -> None:
+        if self.pending_idx is not None or self.fill_in_flight:
+            return
+        if self.current_idx is None:
+            raise RuntimeError("cannot prepare a follow-up batch before consuming the first prefetched batch")
+        self._start_cpu_fill(1 - self.current_idx)
 
     def _receive_ready_slot(self) -> None:
         filled_idx, error = self.ready_slots.get()
+        self.fill_in_flight = False
         if error is not None:
             raise RuntimeError(f"failed to prepare next {self.split} batch") from error
         self.pending_idx = filled_idx
