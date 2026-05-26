@@ -79,11 +79,9 @@ JSONL_TEXT_FIELD="${JSONL_TEXT_FIELD:-text}"
 VAL_FRACTION="${VAL_FRACTION:-0.0909090909}"
 DATA_DIR="${DATA_DIR:-data/processed/${FINEWEB_DATASET_SLUG}_${FINEWEB_CONFIG}_${FINEWEB_DOCS}_d${DEPTH}}"
 RAW_FILE="${RAW_FILE:-data/raw/${FINEWEB_DATASET_SLUG}_${FINEWEB_CONFIG}_${FINEWEB_DOCS}.jsonl}"
-LM_EVAL_SUITE="${LM_EVAL_SUITE:-standard}"
-LM_EVAL_TASKS="${LM_EVAL_TASKS:-}"
-LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT:-}"
-LM_EVAL_LIMIT="${LM_EVAL_LIMIT:-}"
-LM_EVAL_OUTPUT="${LM_EVAL_OUTPUT:-runs/$RUN_NAME/eval/lm_eval_results.json}"
+DISABLE_EVAL="${DISABLE_EVAL:-0}"
+DISABLE_BENCHMARKS="${DISABLE_BENCHMARKS:-0}"
+EVAL_FINAL_ONLY="${EVAL_FINAL_ONLY:-0}"
 
 export RAW_FILE FINEWEB_DOCS FINEWEB_VARIANT FINEWEB_DATASET FINEWEB_DATASET_SLUG FINEWEB_CONFIG FINEWEB_SPLIT
 export DATA_DIR VOCAB_SIZE MIN_FREQUENCY PREPARE_BATCH_SIZE JSONL_TEXT_FIELD VAL_FRACTION
@@ -277,30 +275,22 @@ then
     --batch-size "$PREPARE_BATCH_SIZE"
 fi
 
-uv run python train.py \
-  --depth "$DEPTH" \
-  --target-param-data-ratio 20 \
-  --data "$DATA_DIR" \
-  --run-name "$RUN_NAME" \
+train_args=(
+  --depth "$DEPTH"
+  --target-param-data-ratio 20
+  --data "$DATA_DIR"
+  --run-name "$RUN_NAME"
   --mlflow-experiment "${FINEWEB_DATASET_SLUG}-d${DEPTH}-validation"
-
-lm_eval_args=(
-  --checkpoint "runs/$RUN_NAME/checkpoints/latest.pt"
-  --tokenizer "$DATA_DIR/tokenizer.json"
-  --output "$LM_EVAL_OUTPUT"
 )
-if [[ -n "$LM_EVAL_TASKS" ]]; then
-  lm_eval_args+=(--tasks "$LM_EVAL_TASKS")
-  if [[ -n "$LM_EVAL_NUM_FEWSHOT" ]]; then
-    lm_eval_args+=(--num-fewshot "$LM_EVAL_NUM_FEWSHOT")
-  fi
-else
-  lm_eval_args+=(--suite "$LM_EVAL_SUITE")
+if [[ "$DISABLE_EVAL" == "1" ]]; then
+  train_args+=(--disable-eval)
+elif [[ "$DISABLE_BENCHMARKS" == "1" ]]; then
+  train_args+=(--disable-benchmarks)
 fi
-if [[ -n "$LM_EVAL_LIMIT" ]]; then
-  lm_eval_args+=(--limit "$LM_EVAL_LIMIT")
+if [[ "$EVAL_FINAL_ONLY" == "1" ]]; then
+  train_args+=(--eval-final-only)
 fi
 
-uv run python run_lm_eval.py "${lm_eval_args[@]}"
+uv run python train.py "${train_args[@]}"
 
 echo "MLflow: uv run mlflow ui --backend-store-uri file://$(pwd)/runs/mlruns"

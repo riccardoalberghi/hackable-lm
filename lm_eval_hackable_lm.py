@@ -35,12 +35,14 @@ class SimpleLMHarness(LM):
 
     def __init__(
         self,
-        checkpoint: str,
+        checkpoint: str | None = None,
         tokenizer: str | None = None,
         device: str = "cuda",
         batch_size: int = 8,
         dtype: str = "bfloat16",
         compile: bool = False,
+        model: torch.nn.Module | None = None,
+        config: Any | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -50,18 +52,30 @@ class SimpleLMHarness(LM):
         if self._device.type == "cuda" and self._dtype not in {None, torch.bfloat16}:
             raise RuntimeError("hackable-lm checkpoints use bf16 weights on CUDA; pass dtype=bfloat16")
 
-        ckpt = load_trusted_checkpoint(checkpoint, map_location="cpu")
-        self._config = config_from_dict(ckpt["config"])
-        self.model = LanguageModel(self._config.model)
-        self.model = apply_precision_policy(self.model, self._config.precision)
-        self.model.load_state_dict(ckpt["model"])
+        if model is None:
+            if checkpoint is None:
+                raise ValueError("checkpoint is required unless an in-memory model is provided")
+            ckpt = load_trusted_checkpoint(checkpoint, map_location="cpu")
+            self._config = config_from_dict(ckpt["config"])
+            self.model = LanguageModel(self._config.model)
+            self.model = apply_precision_policy(self.model, self._config.precision)
+            self.model.load_state_dict(ckpt["model"])
+            manifest_data = ckpt.get("run_manifest", {}).get("data", {})
+            tokenizer_path = tokenizer or str(Path(manifest_data.get("data_dir", ".")).joinpath("tokenizer.json"))
+        else:
+            if config is None:
+                raise ValueError("config is required when using an in-memory model")
+            if tokenizer is None:
+                raise ValueError("tokenizer is required when using an in-memory model")
+            self._config = config
+            self.model = model
+            tokenizer_path = tokenizer
+
         self.model.to(self._device)
         self.model.eval()
         if compile:
             self.model = torch.compile(self.model)
 
-        manifest_data = ckpt.get("run_manifest", {}).get("data", {})
-        tokenizer_path = tokenizer or str(Path(manifest_data.get("data_dir", ".")).joinpath("tokenizer.json"))
         self.tokenizer_path = Path(tokenizer_path)
         self.tokenizer = load_tokenizer(self.tokenizer_path)
         self._eot_token_id = self.tokenizer.token_to_id(EOS_TOKEN)

@@ -8,6 +8,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,31 @@ from model import LanguageModel
 from optim import create_optimizer, lr_multiplier
 from repro import compatibility_warnings, load_trusted_checkpoint, seed_everything, write_json, write_run_manifest
 from tokenizer import tokenizer_manifest
+
+
+COMMONSENSE_TASKS = [
+    "hellaswag",
+    "piqa",
+    "arc_easy",
+    "arc_challenge",
+    "winogrande",
+    "openbookqa",
+    "boolq",
+]
+LAMBADA_TASKS = ["lambada_openai"]
+
+
+@dataclass(frozen=True)
+class EvalSuite:
+    name: str
+    tasks: list[str]
+    num_fewshot: int
+
+
+STANDARD_EVAL_SUITES = [
+    EvalSuite("commonsense_0shot", COMMONSENSE_TASKS, 0),
+    EvalSuite("lambada_0shot", LAMBADA_TASKS, 0),
+]
 
 
 def cuda_required() -> torch.device:
@@ -214,13 +240,193 @@ def training_data_info(loader: MemmapDataLoader, *, overfit_first_batch: bool) -
     return info
 
 
-def validation_batch_count(start_step: int, num_iterations: int, log_interval: int, val_interval: int, val_batches: int) -> int:
-    count = 0
+def checkpoint_evaluation_steps(
+    start_step: int,
+    num_iterations: int,
+    checkpoint_interval: int,
+    *,
+    eval_final_only: bool = False,
+) -> list[int]:
+    if checkpoint_interval <= 0:
+        raise ValueError("checkpoint_interval must be > 0")
+    final_step = num_iterations - 1
+    if final_step < start_step:
+        return []
+    if eval_final_only:
+        return [final_step]
+    steps = []
     for step in range(start_step, num_iterations):
-        log_this_step = step % log_interval == 0 or step == num_iterations - 1
-        if log_this_step and step % val_interval == 0 and step != start_step:
-            count += val_batches
-    return count
+        if should_checkpoint_step(step, start_step, num_iterations, checkpoint_interval):
+            steps.append(step)
+    return steps
+
+
+def should_checkpoint_step(step: int, start_step: int, num_iterations: int, checkpoint_interval: int) -> bool:
+    final_step = num_iterations - 1
+    return step == final_step or (step % checkpoint_interval == 0 and step != start_step)
+
+
+def should_evaluate_checkpoint_step(step: int, num_iterations: int, *, eval_final_only: bool) -> bool:
+    return step == num_iterations - 1 or not eval_final_only
+
+
+def validation_batch_count(
+    start_step: int,
+    num_iterations: int,
+    checkpoint_interval: int,
+    val_batches: int,
+    *,
+    eval_enabled: bool = True,
+    eval_final_only: bool = False,
+) -> int:
+    if not eval_enabled:
+        return 0
+    return len(
+        checkpoint_evaluation_steps(
+            start_step,
+            num_iterations,
+            checkpoint_interval,
+            eval_final_only=eval_final_only,
+        )
+    ) * val_batches
+
+
+def _sanitize_mlflow_metric_component(value: Any) -> str:
+    text = str(value)
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text)
+    return cleaned.strip("_") or "metric"
+
+
+def _mlflow_metric_name(name: str) -> str:
+    return name[:250]
+
+
+def benchmark_mlflow_metrics(results_by_suite: dict[str, Any]) -> dict[str, float]:
+    metrics = {}
+    for suite_name, suite_result in results_by_suite.items():
+        task_results = suite_result.get("results", {}) if isinstance(suite_result, dict) else {}
+        if not isinstance(task_results, dict):
+            continue
+        for task_name, task_metrics in task_results.items():
+            if not isinstance(task_metrics, dict):
+                continue
+            for metric_name, value in task_metrics.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+                    continue
+                value = float(value)
+                if not math.isfinite(value):
+                    continue
+                key = ".".join(
+                    [
+                        "benchmark",
+                        _sanitize_mlflow_metric_component(suite_name),
+                        _sanitize_mlflow_metric_component(task_name),
+                        _sanitize_mlflow_metric_component(metric_name),
+                    ]
+                )
+                metrics[_mlflow_metric_name(key)] = value
+    return metrics
+
+
+def _log_mlflow_benchmark_metrics(mlflow, results_by_suite: dict[str, Any], *, step: int) -> None:
+    metrics = benchmark_mlflow_metrics(results_by_suite)
+    if metrics:
+        mlflow.log_metrics(metrics, step=step)
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    return str(value)
+
+
+def write_benchmark_results(run_dir: Path, step: int, tokens_seen: int, results_by_suite: dict[str, Any]) -> Path:
+    path = run_dir / "eval" / f"step_{step}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": step,
+        "tokens_seen": tokens_seen,
+        "suites": results_by_suite,
+    }
+    path.write_text(json.dumps(payload, default=_json_default, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def run_benchmark_suites(
+    raw_model,
+    config,
+    tokenizer_path: Path,
+    device: torch.device,
+    *,
+    batch_size: int = 8,
+) -> dict[str, Any]:
+    from lm_eval_hackable_lm import SimpleLMHarness
+
+    import lm_eval
+
+    was_training = raw_model.training
+    try:
+        harness = SimpleLMHarness(
+            model=raw_model,
+            config=config,
+            tokenizer=str(tokenizer_path),
+            device=str(device),
+            batch_size=batch_size,
+            dtype="bfloat16",
+        )
+        return {
+            suite.name: lm_eval.simple_evaluate(
+                model=harness,
+                tasks=suite.tasks,
+                num_fewshot=suite.num_fewshot,
+            )
+            for suite in STANDARD_EVAL_SUITES
+        }
+    finally:
+        raw_model.train(was_training)
+
+
+def run_checkpoint_evaluation(
+    raw_model,
+    loader: MemmapDataLoader,
+    config,
+    device: torch.device,
+    args,
+    data_manifest: dict[str, Any],
+    run_dir: Path,
+    step: int,
+    tokens_seen: int,
+    mlflow,
+) -> dict[str, Any]:
+    if args.disable_eval:
+        return {}
+
+    record: dict[str, Any] = {
+        "val_loss": validate(raw_model, loader, config, device, args.val_batches),
+    }
+    val_bpb = estimate_bits_per_byte(record["val_loss"], data_manifest)
+    if val_bpb is not None:
+        record["val_bpb"] = val_bpb
+
+    if not args.disable_benchmarks:
+        benchmark_results = run_benchmark_suites(
+            raw_model,
+            config,
+            Path(args.data) / "tokenizer.json",
+            device,
+        )
+        benchmark_path = write_benchmark_results(run_dir, step, tokens_seen, benchmark_results)
+        record["benchmark_results"] = str(benchmark_path)
+        record["benchmark_suites"] = sorted(benchmark_results)
+        if mlflow is not None:
+            _log_mlflow_benchmark_metrics(mlflow, benchmark_results, step=step)
+            mlflow.log_artifact(str(benchmark_path), artifact_path="eval")
+
+    return record
 
 
 def require_scheduled_data(loader: MemmapDataLoader, config, args, start_step: int, *, validate_rank: bool) -> None:
@@ -228,7 +434,14 @@ def require_scheduled_data(loader: MemmapDataLoader, config, args, start_step: i
     train_batches = 1 if args.overfit_first_batch and remaining_steps > 0 else remaining_steps * config.gradient_accumulation_steps
     loader.require_batches("train", train_batches, config.device_batch_size)
     if validate_rank:
-        val_batches = validation_batch_count(start_step, config.num_iterations, args.log_interval, args.val_interval, args.val_batches)
+        val_batches = validation_batch_count(
+            start_step,
+            config.num_iterations,
+            args.checkpoint_interval,
+            args.val_batches,
+            eval_enabled=not args.disable_eval,
+            eval_final_only=args.eval_final_only,
+        )
         loader.require_batches("val", val_batches, config.device_batch_size)
 
 
@@ -613,9 +826,11 @@ def main() -> None:
     )
     parser.add_argument("--allow-resume-mismatch", action="store_true", help="resume even if checkpoint provenance differs from requested run settings")
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--val-interval", type=int, default=100)
     parser.add_argument("--val-batches", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
+    parser.add_argument("--disable-eval", action="store_true", help="disable checkpoint validation and benchmark evaluation")
+    parser.add_argument("--disable-benchmarks", action="store_true", help="disable lm-eval benchmarks while keeping validation bpb")
+    parser.add_argument("--eval-final-only", action="store_true", help="run checkpoint validation and benchmarks only for the final checkpoint")
     parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
     parser.add_argument("--mlp-backend", choices=["torch", "triton"])
@@ -660,6 +875,12 @@ def main() -> None:
     args.optimizer = args.optimizer if args.optimizer is not None else DEFAULTS["optimizer"]
     if args.peak_flops is not None and args.peak_flops <= 0:
         parser.error("--peak-flops must be > 0")
+    if args.log_interval <= 0:
+        parser.error("--log-interval must be > 0")
+    if args.checkpoint_interval <= 0:
+        parser.error("--checkpoint-interval must be > 0")
+    if args.val_batches <= 0:
+        parser.error("--val-batches must be > 0")
     if args.depth is None and args.target_params is None:
         parser.error("--depth is required unless --target-params is provided or --match-run fills it")
 
@@ -817,14 +1038,14 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     train_start_time = time.perf_counter()
     last_time = time.perf_counter()
+    last_logged_tokens_seen = tokens_seen
     last_train_record = None
     last_val_loss = None
     tokens_sec_samples = []
     try:
         for step in range(start_step, config.num_iterations):
-            log_this_step = is_main and (step % args.log_interval == 0 or step == config.num_iterations - 1)
-            periodic_checkpoint_this_step = step % args.checkpoint_interval == 0 and step != start_step
-            checkpoint_this_step = periodic_checkpoint_this_step
+            checkpoint_this_step = should_checkpoint_step(step, start_step, config.num_iterations, args.checkpoint_interval)
+            log_this_step = is_main and (step % args.log_interval == 0 or checkpoint_this_step)
             mark_compiled_step_begin(config.compile)
             optimizer.zero_grad(set_to_none=True)
             total_loss = None
@@ -866,11 +1087,14 @@ def main() -> None:
             optimizer.step()
             tokens_seen += config.global_batch_tokens
 
+            record = None
             if log_this_step:
                 now = time.perf_counter()
                 elapsed = now - last_time
-                tokens_sec = config.global_batch_tokens * args.log_interval / elapsed if step != start_step else 0.0
+                logged_tokens = tokens_seen - last_logged_tokens_seen
+                tokens_sec = logged_tokens / elapsed if step != start_step and logged_tokens > 0 else 0.0
                 last_time = now
+                last_logged_tokens_seen = tokens_seen
                 train_loss = float((total_loss / config.gradient_accumulation_steps).item())
                 model_flops_sec = config.estimated_flops_per_token * tokens_sec if tokens_sec else 0.0
                 record = {
@@ -904,20 +1128,6 @@ def main() -> None:
                 if args.peak_flops is not None:
                     record["mfu"] = model_flops_sec / args.peak_flops if model_flops_sec else 0.0
                     record["peak_flops"] = args.peak_flops
-                if step % args.val_interval == 0 and step != start_step:
-                    record["val_loss"] = validate(raw_model, loader, config, device, args.val_batches)
-                    val_bpb = estimate_bits_per_byte(record["val_loss"], data_manifest)
-                    if val_bpb is not None:
-                        record["val_bpb"] = val_bpb
-                    last_val_loss = record["val_loss"]
-                print(format_train_record(record, config.num_iterations), flush=True)
-                train_log.write(json.dumps(record) + "\n")
-                train_log.flush()
-                last_train_record = record
-                if tokens_sec:
-                    tokens_sec_samples.append(tokens_sec)
-                if mlflow is not None:
-                    _log_mlflow_metrics(mlflow, record, step=step)
             if checkpoint_this_step:
                 data_loader_state = checkpoint_data_loader_state(loader, ddp)
                 if is_main:
@@ -935,26 +1145,48 @@ def main() -> None:
                     )
                     if mlflow is not None:
                         mlflow.log_artifact(str(run_dir / "checkpoints" / "latest.pt"), artifact_path="checkpoints")
+                    eval_record = (
+                        run_checkpoint_evaluation(
+                            raw_model,
+                            loader,
+                            config,
+                            device,
+                            args,
+                            data_manifest,
+                            run_dir,
+                            step,
+                            tokens_seen,
+                            mlflow,
+                        )
+                        if should_evaluate_checkpoint_step(
+                            step,
+                            config.num_iterations,
+                            eval_final_only=args.eval_final_only,
+                        )
+                        else {}
+                    )
+                    if record is not None:
+                        record.update(eval_record)
+                    if "val_loss" in eval_record:
+                        last_val_loss = eval_record["val_loss"]
+                if ddp["enabled"]:
+                    dist.barrier()
                 if fixed_train_batch is None and step != config.num_iterations - 1:
                     train_prefetcher.prepare_next()
+            if record is not None:
+                print(format_train_record(record, config.num_iterations), flush=True)
+                train_log.write(json.dumps(record) + "\n")
+                train_log.flush()
+                last_train_record = record
+                if record["tokens_sec"]:
+                    tokens_sec_samples.append(record["tokens_sec"])
+                if mlflow is not None:
+                    _log_mlflow_metrics(mlflow, record, step=step)
 
-        data_loader_state = checkpoint_data_loader_state(loader, ddp)
         if ddp["enabled"]:
             dist.barrier()
         if not is_main:
             return
-        if data_loader_state is None:
-            raise RuntimeError("main rank did not receive final data loader state")
-        save_checkpoint(
-            run_dir / "checkpoints" / "latest.pt",
-            raw_model,
-            optimizer,
-            config,
-            manifest,
-            config.num_iterations - 1,
-            tokens_seen,
-            data_loader_state,
-        )
         elapsed = time.perf_counter() - train_start_time
         avg_tokens_sec = sum(tokens_sec_samples) / len(tokens_sec_samples) if tokens_sec_samples else None
         final = {

@@ -38,12 +38,76 @@ def test_training_data_info_marks_first_batch_overfit() -> None:
 
 
 @requires_torch
-def test_validation_batch_count_matches_training_schedule() -> None:
-    from train import validation_batch_count
+def test_checkpoint_evaluation_steps_match_checkpoint_schedule() -> None:
+    from train import checkpoint_evaluation_steps, validation_batch_count
 
-    assert validation_batch_count(start_step=0, num_iterations=11, log_interval=1, val_interval=5, val_batches=3) == 6
-    assert validation_batch_count(start_step=5, num_iterations=11, log_interval=1, val_interval=5, val_batches=3) == 3
-    assert validation_batch_count(start_step=0, num_iterations=11, log_interval=10, val_interval=5, val_batches=3) == 3
+    assert checkpoint_evaluation_steps(start_step=0, num_iterations=11, checkpoint_interval=5) == [5, 10]
+    assert checkpoint_evaluation_steps(start_step=5, num_iterations=11, checkpoint_interval=5) == [10]
+    assert checkpoint_evaluation_steps(start_step=0, num_iterations=11, checkpoint_interval=20) == [10]
+    assert checkpoint_evaluation_steps(
+        start_step=0,
+        num_iterations=11,
+        checkpoint_interval=5,
+        eval_final_only=True,
+    ) == [10]
+    assert validation_batch_count(start_step=0, num_iterations=11, checkpoint_interval=5, val_batches=3) == 6
+    assert (
+        validation_batch_count(
+            start_step=0,
+            num_iterations=11,
+            checkpoint_interval=5,
+            val_batches=3,
+            eval_final_only=True,
+        )
+        == 3
+    )
+    assert (
+        validation_batch_count(
+            start_step=0,
+            num_iterations=11,
+            checkpoint_interval=5,
+            val_batches=3,
+            eval_enabled=False,
+        )
+        == 0
+    )
+
+
+@requires_torch
+def test_standard_benchmark_suites_use_expected_tasks() -> None:
+    from train import STANDARD_EVAL_SUITES
+
+    suites = {suite.name: suite for suite in STANDARD_EVAL_SUITES}
+    assert suites["commonsense_0shot"].num_fewshot == 0
+    assert suites["lambada_0shot"].num_fewshot == 0
+    assert "openbookqa" in suites["commonsense_0shot"].tasks
+
+
+@requires_torch
+def test_benchmark_mlflow_metrics_extracts_numeric_task_results() -> None:
+    from train import benchmark_mlflow_metrics
+
+    metrics = benchmark_mlflow_metrics(
+        {
+            "commonsense_0shot": {
+                "results": {
+                    "hellaswag": {
+                        "acc,none": 0.25,
+                        "alias": "HellaSwag",
+                    },
+                    "boolq": {
+                        "acc_norm,none": 0.5,
+                        "ignored": True,
+                    },
+                },
+            },
+        }
+    )
+
+    assert metrics == {
+        "benchmark.commonsense_0shot.hellaswag.acc_none": 0.25,
+        "benchmark.commonsense_0shot.boolq.acc_norm_none": 0.5,
+    }
 
 
 @requires_torch

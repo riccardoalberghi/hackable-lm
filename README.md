@@ -57,8 +57,9 @@ FlashAttention 2. CPU paths exist for tests only, not for real training.
 ## Run Training
 
 The built-in FineWeb script downloads data, trains a tokenizer, prepares token
-memmaps, trains the model, runs the standard `lm-eval` pass, and prints the
-MLflow command at the end. Its default edu source is
+memmaps, trains the model, evaluates validation BPB and the standard `lm-eval`
+benchmarks at each checkpoint, and prints the MLflow command at the end. Its
+default edu source is
 `HuggingFaceTB/smollm-corpus` with config `fineweb-edu-dedup`.
 
 ```bash
@@ -92,6 +93,10 @@ uv run python train.py \
   --data data/processed \
   --run-name d12
 ```
+
+Checkpoint evaluation is enabled by default. Pass `--eval-final-only` to
+evaluate only the final checkpoint, `--disable-benchmarks` to keep validation
+BPB only, or `--disable-eval` to skip both validation and benchmarks.
 
 To inspect local MLflow logs:
 
@@ -167,22 +172,14 @@ unexpected provenance mismatches without needing `--allow-resume-mismatch`.
 
 ## Eval
 
-```bash
-uv run python run_lm_eval.py \
-  --checkpoint runs/d12/checkpoints/latest.pt \
-  --tokenizer data/processed/tokenizer.json \
-  --output runs/d12/eval/lm_eval_results.json
-```
+Training runs validation BPB and the standard benchmark suite whenever it writes
+a checkpoint, and reports those metrics to MLflow. Use `--eval-final-only` when
+you want intermediate checkpoints saved without intermediate eval runs.
 
 The default `standard` suite runs:
 
 - 0-shot commonsense: HellaSwag, PIQA, ARC-Easy, ARC-Challenge, WinoGrande, OpenBookQA, BoolQ
 - 0-shot LAMBADA: `lambada_openai`
-- 5-shot MMLU: `mmlu`
-
-Use `--suite commonsense`, `--suite lambada`, or `--suite mmlu` to run one
-group. Use `--tasks task_a,task_b --num-fewshot N` for an intentional custom
-run. By default there is no sample limit; pass `--limit` only for smoke checks.
 
 ## Tests
 
