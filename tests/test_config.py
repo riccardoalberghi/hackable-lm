@@ -4,6 +4,7 @@ import math
 
 from config import (
     DEFAULTS,
+    MODULE_BACKEND_FIELDS,
     auto_device_batch_size,
     config_from_dict,
     depth_dimensions,
@@ -32,18 +33,16 @@ def test_config_derivation() -> None:
     assert DEFAULTS["attention_full_every"] == 4
     assert DEFAULTS["global_batch_tokens"] == 2**20
     assert DEFAULTS["lr_depth_stability_reference"] == 6
-    assert DEFAULTS["mlp_backend"] == "triton"
-    assert DEFAULTS["loss_backend"] == "triton"
-    assert DEFAULTS["rope_backend"] == "triton"
+    for name in MODULE_BACKEND_FIELDS:
+        assert DEFAULTS[name] == "triton"
     assert DEFAULTS["optimizer"] == "muon_adamw"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
-    assert default_cfg.model.mlp_backend == "triton"
-    assert default_cfg.model.loss_backend == "triton"
     assert default_cfg.model.loss_chunk_size == DEFAULTS["loss_chunk_size"]
-    assert default_cfg.model.rope_backend == "triton"
+    for name in MODULE_BACKEND_FIELDS:
+        assert getattr(default_cfg.model, name) == "triton"
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
     assert pattern == [512, 512, 512, None, 512, 512, 512, None]
     short_pattern = [layer_attention_window(i, 3, 512, 4) for i in range(3)]
@@ -61,19 +60,29 @@ def test_config_derivation() -> None:
     hybrid_style = cfg.to_dict()
     hybrid_style["model"].pop("attention_full_every")
     assert config_from_dict(hybrid_style).model.attention_full_every is None
-    legacy_style = cfg.to_dict()
-    legacy_style["model"].pop("loss_backend")
-    assert config_from_dict(legacy_style).model.loss_backend == DEFAULTS["loss_backend"]
-    legacy_mlp_backend = cfg.to_dict()
-    legacy_mlp_backend["model"].pop("mlp_backend")
-    assert config_from_dict(legacy_mlp_backend).model.mlp_backend == DEFAULTS["mlp_backend"]
+    for name in MODULE_BACKEND_FIELDS:
+        no_backend_style = cfg.to_dict()
+        no_backend_style["model"].pop(name)
+        assert getattr(config_from_dict(no_backend_style).model, name) == DEFAULTS[name]
     stale_mlp_style = cfg.to_dict()
     stale_mlp_style["model"]["mlp_activation"] = "legacy"
     assert not hasattr(config_from_dict(stale_mlp_style).model, "mlp_activation")
-    torch_mlp = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, mlp_backend="torch")
-    assert torch_mlp.model.mlp_backend == "torch"
-    triton_rope = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="triton")
-    assert triton_rope.model.rope_backend == "triton"
+    mixed_backend_values = {
+        "qkv_backend": "torch",
+        "output_backend": "cute",
+        "gate_up_backend": "triton",
+        "down_backend": "torch",
+        "lm_head_backend": "cute",
+    }
+    mixed_ops = resolve_config(
+        depth=2,
+        vocab_size=128,
+        precision="fp32_test",
+        compile_model=False,
+        **mixed_backend_values,
+    )
+    for name, backend in mixed_backend_values.items():
+        assert getattr(mixed_ops.model, name) == backend
     custom_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=8192)
     assert custom_loss_chunk.model.loss_chunk_size == 8192
     heuristic_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=0)
@@ -106,11 +115,11 @@ def test_config_shape_and_budget_controls() -> None:
     else:
         raise AssertionError("negative loss_chunk_size should fail")
     try:
-        resolve_config(depth=6, vocab_size=32768, mlp_backend="cuda")
+        resolve_config(depth=6, vocab_size=32768, qkv_backend="cuda")
     except ValueError as exc:
-        assert "unknown MLP backend" in str(exc)
+        assert "unknown qkv_backend" in str(exc)
     else:
-        raise AssertionError("unknown mlp_backend should fail")
+        raise AssertionError("unknown qkv_backend should fail")
 
 
 def test_auto_device_batch_size_uses_memory_cap() -> None:

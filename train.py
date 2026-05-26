@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from config import COMPARISON_MODES, DEFAULTS, resolve_config
+from config import COMPARISON_MODES, DEFAULTS, MODULE_BACKEND_FIELDS, MODULE_BACKENDS, resolve_config
 from data import MemmapDataLoader, load_manifest
 from kernels import apply_precision_policy, compile_training_model, mark_compiled_step_begin, resolve_kernel_backends
 from model import LanguageModel
@@ -631,18 +631,13 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
         args.global_batch_tokens = cfg.get("global_batch_tokens")
     if args.device_batch_size is None:
         args.device_batch_size = cfg.get("device_batch_size")
-    if args.mlp_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.mlp_backend = model_cfg.get("mlp_backend")
-    if args.loss_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.loss_backend = model_cfg.get("loss_backend")
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    for name in MODULE_BACKEND_FIELDS:
+        if getattr(args, name) is None:
+            setattr(args, name, model_cfg.get(name))
     if args.loss_chunk_size is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.loss_chunk_size = model_cfg.get("loss_chunk_size")
-    if args.rope_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.rope_backend = model_cfg.get("rope_backend")
     if args.optimizer is None:
         args.optimizer = cfg.get("optimizer")
     if args.seed is None:
@@ -833,10 +828,9 @@ def main() -> None:
     parser.add_argument("--eval-final-only", action="store_true", help="run checkpoint validation and benchmarks only for the final checkpoint")
     parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
-    parser.add_argument("--mlp-backend", choices=["torch", "triton"])
-    parser.add_argument("--loss-backend", choices=["torch", "triton"])
+    for name in MODULE_BACKEND_FIELDS:
+        parser.add_argument(f"--{name.replace('_', '-')}", choices=sorted(MODULE_BACKENDS))
     parser.add_argument("--loss-chunk-size", type=int, help="token rows per linear CE chunk; use 0 for the built-in heuristic")
-    parser.add_argument("--rope-backend", choices=["torch", "triton"])
     parser.add_argument("--optimizer", choices=["muon_adamw", "adamw"])
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-mode", default=DEFAULTS["compile_mode"], choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
@@ -866,12 +860,12 @@ def main() -> None:
     args.attention_window = args.attention_window if args.attention_window is not None else DEFAULTS["attention_window"]
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
     args.target_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio is not None else DEFAULTS["target_param_data_ratio"]
-    args.mlp_backend = args.mlp_backend if args.mlp_backend is not None else DEFAULTS["mlp_backend"]
-    args.loss_backend = args.loss_backend if args.loss_backend is not None else DEFAULTS["loss_backend"]
+    for name in MODULE_BACKEND_FIELDS:
+        if getattr(args, name) is None:
+            setattr(args, name, DEFAULTS[name])
     args.loss_chunk_size = args.loss_chunk_size if args.loss_chunk_size is not None else DEFAULTS["loss_chunk_size"]
     if args.loss_chunk_size < 0:
         parser.error("--loss-chunk-size must be >= 0")
-    args.rope_backend = args.rope_backend if args.rope_backend is not None else DEFAULTS["rope_backend"]
     args.optimizer = args.optimizer if args.optimizer is not None else DEFAULTS["optimizer"]
     if args.peak_flops is not None and args.peak_flops <= 0:
         parser.error("--peak-flops must be > 0")
@@ -915,12 +909,10 @@ def main() -> None:
         compile_mode=args.compile_mode,
         compile_capture_scalar_outputs=not args.no_compile_capture_scalar_outputs,
         kernel_backend="torch",
-        mlp_backend=args.mlp_backend,
-        loss_backend=args.loss_backend,
         loss_chunk_size=args.loss_chunk_size,
-        rope_backend=args.rope_backend,
         optimizer=args.optimizer,
         comparison_mode=args.comparison_mode,
+        **{name: getattr(args, name) for name in MODULE_BACKEND_FIELDS},
     )
     if ddp["enabled"]:
         total_grad_accum = config.gradient_accumulation_steps
@@ -943,9 +935,7 @@ def main() -> None:
         compile_model=config.compile,
         compile_mode=config.compile_mode,
         compile_capture_scalar_outputs=config.compile_capture_scalar_outputs,
-        loss_backend=config.model.loss_backend,
-        rope_backend=config.model.rope_backend,
-        mlp_backend=config.model.mlp_backend,
+        **{name: getattr(config.model, name) for name in MODULE_BACKEND_FIELDS},
     ).to_dict()
     loader = MemmapDataLoader(
         args.data,

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from config import resolve_config
+from config import MODULE_BACKEND_FIELDS, resolve_config
 from conftest import requires_cuda, requires_torch, torch
+
+
+TORCH_BACKENDS = {name: "torch" for name in MODULE_BACKEND_FIELDS}
 
 
 @pytest.mark.cuda
@@ -21,7 +24,7 @@ def test_optimizer_resume_muon_state_device() -> None:
         device_batch_size=2,
         precision="bf16",
         compile_model=False,
-        loss_backend="torch",
+        **TORCH_BACKENDS,
     )
     device = torch.device("cuda")
     model = apply_precision_policy(LanguageModel(cfg.model).to(device), cfg.precision)

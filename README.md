@@ -30,7 +30,7 @@ MFU* is usually in the high 50s to low 60s, reported against the standard bf16 p
 - `hackablebpe` Rust byte-level BPE tokenizer trainer, encoder, and decoder
 - document-offset token memmap preprocessing
 - decoder-only causal LM in `model.py`
-- RoPE, RMSNorm, QK norm, SwiGLU MLPs, fused QKV and fused gate/up projections
+- fused operator modules for QKV, residual/RMSNorm projections, SwiGLU, and LM head/loss
 - local-window attention with periodic full attention
 - Muon for transformer matrices and AdamW for embeddings, head, and small params
 - strict CUDA training path in `train.py`
@@ -115,7 +115,7 @@ The intended workflow is boring on purpose:
 
 For fair comparisons, keep the boring fields aligned: data hashes, tokenizer
 hash, split seed, data shuffle seed, sequence length, global batch tokens,
-optimizer grouping, precision, kernel backend, scaling policy, and seed.
+optimizer grouping, precision, attention backend, module backends, scaling policy, and seed.
 
 When a candidate should inherit the baseline budget, use `--match-run`:
 
