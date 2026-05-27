@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from config import MODULE_BACKEND_FIELDS, resolve_config
 from conftest import requires_torch, torch
 
@@ -81,25 +79,6 @@ def test_model_forward_and_optimizer_grouping() -> None:
         ),
         (cfg.model.mlp_hidden, cfg.model.mlp_hidden),
     ]
-
-
-@requires_torch
-def test_model_rejects_invalid_kv_head_count() -> None:
-    from model import LanguageModel
-
-    cfg = resolve_config(
-        depth=5,
-        vocab_size=128,
-        sequence_len=8,
-        device_batch_size=2,
-        precision="fp32_test",
-        compile_model=False,
-        **TORCH_BACKENDS,
-    )
-    cfg.model.n_kv_head = 2
-
-    with pytest.raises(AssertionError):
-        LanguageModel(cfg.model)
 
 
 @requires_torch

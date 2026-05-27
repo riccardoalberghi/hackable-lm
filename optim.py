@@ -401,7 +401,7 @@ def _adamw_group(name: str, params: list[torch.nn.Parameter], lr: float, weight_
 
 
 def create_optimizer(model: torch.nn.Module, config: Any) -> MuonAdamW:
-    optimizer_kind = getattr(config, "optimizer", "muon_adamw")
+    optimizer_kind = config.optimizer
     if optimizer_kind not in {"muon_adamw", "adamw"}:
         raise ValueError(f"unknown optimizer {optimizer_kind!r}")
 

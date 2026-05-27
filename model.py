@@ -26,22 +26,16 @@ class AcceleratedModule(nn.Module):
     def selected_backend(self) -> str:
         if self.backend_attr is None:
             return "torch"
-        return getattr(self.config, self.backend_attr, "torch")
+        return getattr(self.config, self.backend_attr)
 
     def forward(self, *args, **kwargs):
         backend = self.selected_backend()
         if backend == "torch":
             return self.fwd_torch(*args, **kwargs)
         fwd_backend = getattr(self, f"fwd_{backend}", None)
-        if fwd_backend is None and backend == "triton":
-            return self.fwd_torch(*args, **kwargs)
         if fwd_backend is None:
             raise RuntimeError(f"{type(self).__name__} does not support backend {backend!r}")
         return fwd_backend(*args, **kwargs)
-
-    def fwd_cute(self, *args, **kwargs):
-        raise RuntimeError(f"{type(self).__name__} has no CuTE implementation yet")
-
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, param: bool = False) -> None:
@@ -90,11 +84,6 @@ class QKVProjection(AcceleratedModule):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.head_dim = config.head_dim
-        assert (
-            self.n_kv_head > 0
-            and self.n_kv_head <= self.n_head
-            and self.n_head % self.n_kv_head == 0
-        ), "n_kv_head must be positive, no greater than n_head, and divide n_head"
         self.q_dim = config.n_head * config.head_dim
         self.kv_dim = config.n_kv_head * config.head_dim
         self.qkv_proj = nn.Linear(config.n_embd, self.q_dim + 2 * self.kv_dim, bias=False)

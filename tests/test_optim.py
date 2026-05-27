@@ -50,15 +50,15 @@ def test_muon_step_uses_nesterov_momentum() -> None:
 
     expected_buffer.lerp_(grads, 1.0 - momentum.item())
     nesterov_input = grads.lerp(expected_buffer, momentum.item()).bfloat16()
-    legacy_input = expected_buffer.bfloat16()
+    momentum_only_input = expected_buffer.bfloat16()
     expected_params = params - _muon_orthogonalize(nesterov_input).to(params.dtype) * 0.1
-    legacy_params = params - _muon_orthogonalize(legacy_input).to(params.dtype) * 0.1
+    momentum_only_params = params - _muon_orthogonalize(momentum_only_input).to(params.dtype) * 0.1
 
     muon_step_fused(grads, params, momentum_buffer, momentum, torch.tensor(0.1), torch.tensor(0.0))
 
     assert torch.allclose(momentum_buffer, expected_buffer)
     assert torch.allclose(params, expected_params, atol=1e-3, rtol=1e-3)
-    assert not torch.allclose(params, legacy_params, atol=1e-3, rtol=1e-3)
+    assert not torch.allclose(params, momentum_only_params, atol=1e-3, rtol=1e-3)
 
 
 @requires_torch

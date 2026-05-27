@@ -36,7 +36,7 @@ def test_bf16_precision_policy_leaves_modules_unchanged() -> None:
 
 
 @requires_torch
-def test_swiglu_torch_fallback_matches_baseline_and_backward() -> None:
+def test_swiglu_cpu_matches_baseline_and_backward() -> None:
     import torch.nn.functional as F
 
     import kernels
@@ -127,7 +127,7 @@ def test_flash_attention_casts_qkv_to_bfloat16() -> None:
 
 
 @requires_torch
-def test_qk_norm_rope_torch_fallback_matches_reference_and_backward() -> None:
+def test_qk_norm_rope_cpu_matches_reference_and_backward() -> None:
     import kernels
 
     torch.manual_seed(0)
@@ -168,12 +168,16 @@ def test_kernel_resolution_and_hashing() -> None:
     from kernels import TRITON_MODULE_BACKENDS, resolve_kernel_backends
     from repro import hash_directory
 
+    requested_backends = {
+        name: "triton" if name in TRITON_MODULE_BACKENDS else "torch"
+        for name in MODULE_BACKEND_FIELDS
+    }
     info = resolve_kernel_backends(
         "torch",
         "fp32_test",
         False,
         allow_torch_backend=True,
-        **{name: "triton" for name in MODULE_BACKEND_FIELDS},
+        **requested_backends,
     )
     assert info.attention_backend in {"flash_attn_2", "torch_sdpa"}
     for name in MODULE_BACKEND_FIELDS:

@@ -7,7 +7,7 @@ from typing import Any
 
 SCALING_POLICY = "depth_simple"
 COMPARISON_MODES = {"same_depth", "same_params", "same_tokens", "same_bytes", "same_flops", "same_time"}
-MODULE_BACKENDS = {"torch", "triton", "cute"}
+MODULE_BACKENDS = {"torch", "triton"}
 MODULE_BACKEND_FIELDS = (
     "qkv_backend",
     "output_backend",
@@ -39,7 +39,11 @@ DEFAULTS = {
     "final_lr_frac": 0.1,
     "compile_mode": "max-autotune",
     "compile_capture_scalar_outputs": True,
-    **{name: "triton" for name in MODULE_BACKEND_FIELDS},
+    "qkv_backend": "triton",
+    "output_backend": "torch",
+    "gate_up_backend": "triton",
+    "down_backend": "torch",
+    "lm_head_backend": "triton",
     "loss_chunk_size": 4096,
 }
 
@@ -473,33 +477,5 @@ def resolve_config(
 
 def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
     data = dict(obj)
-    data.pop("D_REF", None)
-    data.pop("B_REF", None)
-    data.pop("reference_depth", None)
-    data.pop("reference_batch_tokens", None)
-    data.pop("predicted_batch_tokens", None)
-    data.pop("dmodel_lr_scale", None)
-    data.setdefault("lr_scheduler", DEFAULTS["lr_scheduler"])
-    data.setdefault("optimizer", DEFAULTS["optimizer"])
-    data.setdefault("total_gradient_accumulation_steps", data["gradient_accumulation_steps"])
-    data.setdefault("world_size", 1)
-    model_data = dict(data["model"])
-    if "attention_window" not in model_data:
-        model_data["attention_window"] = None
-    if "attention_full_every" not in model_data:
-        model_data["attention_full_every"] = None
-    model_data.setdefault("rope_fraction", 0.25)
-    model_data.pop("mlp_activation", None)
-    model_data.pop("tie_embeddings", None)
-    for name in MODULE_BACKEND_FIELDS:
-        model_data.setdefault(name, DEFAULTS[name])
-        try:
-            model_data[name] = normalize_module_backend(name, model_data[name])
-        except ValueError:
-            model_data[name] = DEFAULTS[name]
-    model_data.setdefault("loss_chunk_size", DEFAULTS["loss_chunk_size"])
-    model_data["attention_window"] = normalize_attention_window(model_data["attention_window"])
-    model_data["attention_full_every"] = normalize_attention_full_every(model_data["attention_full_every"])
-    data["kernel_backend"] = "torch"
-    data["model"] = ModelConfig(**model_data)
+    data["model"] = ModelConfig(**dict(data["model"]))
     return ResolvedConfig(**data)

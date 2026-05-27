@@ -22,7 +22,7 @@ from data import MemmapDataLoader, load_manifest
 from kernels import apply_precision_policy, compile_training_model, mark_compiled_step_begin, resolve_kernel_backends
 from model import LanguageModel
 from optim import create_optimizer, lr_multiplier
-from repro import compatibility_warnings, load_trusted_checkpoint, seed_everything, write_json, write_run_manifest
+from repro import load_trusted_checkpoint, seed_everything, write_json, write_run_manifest
 from tokenizer import tokenizer_manifest
 
 
@@ -553,12 +553,7 @@ def grad_global_norm(parameters: list[torch.nn.Parameter], norm_type: float = 2.
     grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
         return torch.tensor(0.0)
-    get_total_norm = getattr(torch.nn.utils, "get_total_norm", None)
-    if get_total_norm is not None:
-        return get_total_norm(grads, norm_type=norm_type, foreach=True)
-    device = grads[0].device
-    norms = torch.stack([torch.linalg.vector_norm(grad.detach(), ord=norm_type).to(device) for grad in grads])
-    return torch.linalg.vector_norm(norms, ord=norm_type)
+    return torch.nn.utils.get_total_norm(grads, norm_type=norm_type, foreach=True)
 
 
 def _start_mlflow(args, run_dir: Path, manifest: dict):
@@ -642,7 +637,7 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
         args.optimizer = cfg.get("optimizer")
     if args.seed is None:
         args.seed = manifest.get("seed")
-    if getattr(args, "data_shuffle_seed", None) is None:
+    if args.data_shuffle_seed is None:
         args.data_shuffle_seed = _nested(manifest, "data", "data_shuffle_seed")
     if args.target_param_data_ratio is None:
         args.target_param_data_ratio = cfg.get("target_param_data_ratio")
@@ -667,52 +662,6 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
             args.target_seconds = cfg.get("target_time_seconds")
         if args.tokens_per_second is None:
             args.tokens_per_second = cfg.get("tokens_per_second")
-
-
-WARMDOWN_ALLOWED_RESUME_MISMATCH_FIELDS = {
-    "lr_schedule",
-    "config.target_tokens",
-    "config.target_bytes",
-    "config.train_flops_budget",
-    "config.target_time_seconds",
-}
-
-
-def _warning_field(warning: str) -> str | None:
-    if not warning.endswith(")"):
-        return None
-    marker = " ("
-    if marker not in warning:
-        return None
-    return warning.rsplit(marker, 1)[1][:-1]
-
-
-def _lr_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    schedule = manifest.get("lr_schedule") or {}
-    config = manifest.get("config") or {}
-    return {
-        "scheduler": schedule.get("scheduler", config.get("lr_scheduler")),
-        "warmdown_ratio": schedule.get("warmdown_ratio", config.get("warmdown_ratio")),
-        "final_lr_frac": schedule.get("final_lr_frac", config.get("final_lr_frac")),
-    }
-
-
-def warmdown_compatibility_warnings(source_manifest: dict[str, Any], target_manifest: dict[str, Any]) -> list[str]:
-    warnings = []
-    for warning in compatibility_warnings(source_manifest, target_manifest):
-        field = _warning_field(warning)
-        if field in WARMDOWN_ALLOWED_RESUME_MISMATCH_FIELDS:
-            continue
-        if warning.startswith("comparison mode differs"):
-            continue
-        warnings.append(warning)
-
-    source_schedule = _lr_schedule_from_manifest(source_manifest)
-    target_schedule = _lr_schedule_from_manifest(target_manifest)
-    for field in ("scheduler", "warmdown_ratio", "final_lr_frac"):
-        if source_schedule.get(field) != target_schedule.get(field):
-            warnings.append(f"LR {field.replace('_', ' ')} differs for warmdown resume")
-    return warnings
 
 
 def checkpoint_data_loader_state(loader: MemmapDataLoader, ddp: dict[str, int | bool]) -> dict[str, Any] | None:
@@ -819,7 +768,6 @@ def main() -> None:
         type=int,
         help="with --resume, continue to this total training-step budget using that target run's WSD warmdown boundary",
     )
-    parser.add_argument("--allow-resume-mismatch", action="store_true", help="resume even if checkpoint provenance differs from requested run settings")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--val-batches", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
@@ -1000,21 +948,6 @@ def main() -> None:
         ckpt = resume_ckpt
         if ckpt is None:
             raise RuntimeError("resume checkpoint was not loaded")
-        resume_manifest = ckpt.get("run_manifest")
-        if resume_manifest:
-            resume_warnings = (
-                warmdown_compatibility_warnings(resume_manifest, manifest)
-                if has_warmdown_resume_target(args)
-                else compatibility_warnings(resume_manifest, manifest)
-            )
-            if resume_warnings and not args.allow_resume_mismatch:
-                formatted = "\n".join(f"- {warning}" for warning in resume_warnings)
-                resume_kind = "warmdown resume checkpoint" if has_warmdown_resume_target(args) else "checkpoint"
-                raise RuntimeError(
-                    f"{resume_kind} provenance does not match requested resume settings:\n"
-                    f"{formatted}\n"
-                    "Pass --allow-resume-mismatch only for an intentional non-paper resume."
-                )
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         restore_rng_state(ckpt["rng_state"])

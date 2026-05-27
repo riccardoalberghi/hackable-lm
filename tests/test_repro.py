@@ -1,58 +1,8 @@
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
 from pathlib import Path
 
-import pytest
-
 from conftest import requires_torch, torch
-
-
-@requires_torch
-def test_manifest_compatibility() -> None:
-    from repro import compatibility_warnings
-
-    base = {
-        "config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16"},
-        "seed": 1,
-        "data": {"data_shuffle_seed": 7, "manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}}},
-    }
-    other = json.loads(json.dumps(base))
-    assert compatibility_warnings(base, other) == []
-    other["seed"] = 2
-    assert compatibility_warnings(base, other)
-    other = json.loads(json.dumps(base))
-    other["data"]["data_shuffle_seed"] = 8
-    assert "data shuffle seed differs" in compatibility_warnings(base, other)[0]
-
-
-@requires_torch
-def test_repro_compare_cli(tmp_path: Path) -> None:
-    pytest.importorskip("numpy")
-    base = {
-        "config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16"},
-        "seed": 1,
-        "data": {
-            "data_shuffle_seed": 7,
-            "manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}, "split_seed": 1},
-        },
-    }
-    same = json.loads(json.dumps(base))
-    different = json.loads(json.dumps(base))
-    different["seed"] = 2
-    left = tmp_path / "left.json"
-    right = tmp_path / "right.json"
-    left.write_text(json.dumps(base), encoding="utf-8")
-    right.write_text(json.dumps(same), encoding="utf-8")
-    ok = subprocess.run([sys.executable, "repro.py", "compare", str(left), str(right), "--fail-on-warning"], cwd=Path.cwd(), text=True, capture_output=True)
-    assert ok.returncode == 0
-    assert '"compatible": true' in ok.stdout
-    right.write_text(json.dumps(different), encoding="utf-8")
-    bad = subprocess.run([sys.executable, "repro.py", "compare", str(left), str(right), "--fail-on-warning"], cwd=Path.cwd(), text=True, capture_output=True)
-    assert bad.returncode == 1
-    assert "seed differs" in bad.stdout
 
 
 @requires_torch

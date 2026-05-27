@@ -125,6 +125,13 @@ def resolve_kernel_backends(
         raise RuntimeError(
             f"unsupported precision mode {precision!r}; the training fast path uses bf16"
         )
+    unsupported_triton = [
+        name
+        for name, backend in requested_module_backends.items()
+        if backend == "triton" and name not in TRITON_MODULE_BACKENDS
+    ]
+    if unsupported_triton:
+        raise ValueError(f"triton has no implementation for module backend fields {unsupported_triton}")
     if any(backend == "triton" for backend in requested_module_backends.values()) and not has_triton and not allow_torch_backend:
         raise RuntimeError(
             "triton module backends require Triton. "
@@ -134,7 +141,7 @@ def resolve_kernel_backends(
     def resolved_backend(name: str) -> str:
         backend = requested_module_backends[name]
         if backend == "triton":
-            return "triton" if has_triton and name in TRITON_MODULE_BACKENDS else "torch"
+            return "triton" if has_triton else "torch"
         return backend
 
     resolved_module_backends = {

@@ -33,8 +33,11 @@ def test_config_derivation() -> None:
     assert DEFAULTS["attention_full_every"] == 4
     assert DEFAULTS["global_batch_tokens"] == 2**20
     assert DEFAULTS["lr_depth_stability_reference"] == 6
-    for name in MODULE_BACKEND_FIELDS:
-        assert DEFAULTS[name] == "triton"
+    assert DEFAULTS["qkv_backend"] == "triton"
+    assert DEFAULTS["output_backend"] == "torch"
+    assert DEFAULTS["gate_up_backend"] == "triton"
+    assert DEFAULTS["down_backend"] == "torch"
+    assert DEFAULTS["lm_head_backend"] == "triton"
     assert DEFAULTS["optimizer"] == "muon_adamw"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
@@ -42,7 +45,7 @@ def test_config_derivation() -> None:
     assert default_cfg.model.attention_full_every == 4
     assert default_cfg.model.loss_chunk_size == DEFAULTS["loss_chunk_size"]
     for name in MODULE_BACKEND_FIELDS:
-        assert getattr(default_cfg.model, name) == "triton"
+        assert getattr(default_cfg.model, name) == DEFAULTS[name]
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
     assert pattern == [512, 512, 512, None, 512, 512, 512, None]
     short_pattern = [layer_attention_window(i, 3, 512, 4) for i in range(3)]
@@ -54,25 +57,12 @@ def test_config_derivation() -> None:
     assert cfg.budget_policy == "param_data_ratio"
     assert cfg.gradient_accumulation_steps >= 1
     assert config_from_dict(cfg.to_dict()).model.n_embd == cfg.model.n_embd
-    old_style = cfg.to_dict()
-    old_style["model"].pop("attention_window")
-    assert config_from_dict(old_style).model.attention_window is None
-    hybrid_style = cfg.to_dict()
-    hybrid_style["model"].pop("attention_full_every")
-    assert config_from_dict(hybrid_style).model.attention_full_every is None
-    for name in MODULE_BACKEND_FIELDS:
-        no_backend_style = cfg.to_dict()
-        no_backend_style["model"].pop(name)
-        assert getattr(config_from_dict(no_backend_style).model, name) == DEFAULTS[name]
-    stale_mlp_style = cfg.to_dict()
-    stale_mlp_style["model"]["mlp_activation"] = "legacy"
-    assert not hasattr(config_from_dict(stale_mlp_style).model, "mlp_activation")
     mixed_backend_values = {
         "qkv_backend": "torch",
-        "output_backend": "cute",
+        "output_backend": "torch",
         "gate_up_backend": "triton",
         "down_backend": "torch",
-        "lm_head_backend": "cute",
+        "lm_head_backend": "triton",
     }
     mixed_ops = resolve_config(
         depth=2,

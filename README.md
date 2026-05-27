@@ -111,11 +111,7 @@ The intended workflow is boring on purpose:
 1. Run a baseline.
 2. Make one local change.
 3. Run the candidate.
-4. Compare the manifests and metrics.
-
-For fair comparisons, keep the boring fields aligned: data hashes, tokenizer
-hash, split seed, data shuffle seed, sequence length, global batch tokens,
-optimizer grouping, precision, attention backend, module backends, scaling policy, and seed.
+4. Compare the run metrics, manifests, and saved configs.
 
 When a candidate should inherit the baseline budget, use `--match-run`:
 
@@ -126,11 +122,6 @@ uv run python train.py \
   --data data/processed \
   --candidate-label idea_x \
   --run-name idea_x_same_tokens
-
-uv run python repro.py compare \
-  runs/d12/manifest.json \
-  runs/idea_x_same_tokens/manifest.json \
-  --fail-on-warning
 ```
 
 `same_depth` is good for a first pass. Use `same_params` when the change alters
@@ -167,8 +158,8 @@ uv run python train.py \
 The checkpoint must resume at or before the target budget's WSD decay start; if
 the requested target would have started warmdown before the checkpoint, training
 exits with an error. The run ends at the requested total step or
-tokens-per-scaling-param budget, restores the data-loader cursor, and rejects
-unexpected provenance mismatches without needing `--allow-resume-mismatch`.
+tokens-per-scaling-param budget, restores the data-loader cursor, and requires
+the checkpoint model config to match the requested model config.
 
 ## Eval
 
