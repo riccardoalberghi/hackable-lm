@@ -95,6 +95,42 @@ def test_swiglu_triton_matches_baseline_and_backward() -> None:
 
 
 @requires_torch
+def test_torch_attention_backend_is_manual_and_matches_reference() -> None:
+    import math
+
+    import kernels
+
+    q = torch.randn(2, 3, 5, 7, requires_grad=True)
+    k = torch.randn(2, 3, 5, 7, requires_grad=True)
+    v = torch.randn(2, 3, 5, 9, requires_grad=True)
+    mask = torch.ones(5, 5, dtype=torch.bool).tril()[None, None, :, :]
+    mask = mask & ((torch.arange(5)[:, None] - torch.arange(5)[None, :]) < 3)[None, None, :, :]
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
+    ref = torch.matmul(torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1), v)
+
+    original_sdpa = kernels.F.scaled_dot_product_attention
+    kernels.F.scaled_dot_product_attention = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SDPA was called"))
+    try:
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+            attn_mask=mask,
+            backend="torch",
+        )
+    finally:
+        kernels.F.scaled_dot_product_attention = original_sdpa
+
+    assert torch.allclose(out, ref, atol=1e-6)
+    out.sum().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
+@requires_torch
 def test_flash_attention_casts_qkv_to_bfloat16() -> None:
     import kernels
 
@@ -124,6 +160,106 @@ def test_flash_attention_casts_qkv_to_bfloat16() -> None:
 
     assert out.dtype == torch.bfloat16
     assert calls == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, 0.0, True, (2, 0))]
+
+
+@requires_torch
+def test_flash_attention_3_casts_qkv_to_bfloat16() -> None:
+    import kernels
+
+    calls = []
+
+    def fake_flash_attn(q, k, v, softmax_scale, causal, window_size):
+        calls.append((q.dtype, k.dtype, v.dtype, softmax_scale, causal, window_size))
+        return q
+
+    original_flash_attn = kernels._FLASH_ATTN_3
+    kernels._FLASH_ATTN_3 = fake_flash_attn
+    try:
+        q = torch.randn(2, 4, 3, 8, dtype=torch.float32)
+        k = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        v = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+            window_size=3,
+            backend="flash_attn_3",
+        )
+    finally:
+        kernels._FLASH_ATTN_3 = original_flash_attn
+
+    assert out.dtype == torch.bfloat16
+    assert calls == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, None, True, (2, 0))]
+
+
+@requires_torch
+def test_flash_attention_4_casts_qkv_to_bfloat16() -> None:
+    import kernels
+
+    calls = []
+
+    def fake_flash_attn(q, k, v, softmax_scale, causal, window_size):
+        calls.append((q.dtype, k.dtype, v.dtype, softmax_scale, causal, window_size))
+        return q
+
+    original_flash_attn = kernels._FLASH_ATTN_4
+    kernels._FLASH_ATTN_4 = fake_flash_attn
+    try:
+        q = torch.randn(2, 4, 3, 8, dtype=torch.float32)
+        k = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        v = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+            window_size=3,
+            backend="flash_attn_4",
+        )
+    finally:
+        kernels._FLASH_ATTN_4 = original_flash_attn
+
+    assert out.dtype == torch.bfloat16
+    assert calls == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, None, True, (2, 0))]
+
+
+@requires_torch
+def test_flex_attention_backend_dispatches_with_block_mask() -> None:
+    import kernels
+
+    calls = []
+    block_mask = object()
+
+    def fake_flex_attention(q, k, v, block_mask, scale, enable_gqa):
+        calls.append((q.shape, k.shape, v.shape, block_mask, scale, enable_gqa))
+        return q
+
+    original_flex = kernels._FLEX_ATTENTION
+    original_create_block_mask = kernels._CREATE_BLOCK_MASK
+    kernels._FLEX_ATTENTION = fake_flex_attention
+    kernels._CREATE_BLOCK_MASK = None
+    try:
+        q = torch.randn(2, 4, 3, 8)
+        k = torch.randn(2, 1, 3, 8)
+        v = torch.randn(2, 1, 3, 8)
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+            block_mask=block_mask,
+            backend="flex_attention",
+        )
+    finally:
+        kernels._FLEX_ATTENTION = original_flex
+        kernels._CREATE_BLOCK_MASK = original_create_block_mask
+
+    assert out is q
+    assert calls == [(q.shape, k.shape, v.shape, block_mask, 8**-0.5, True)]
 
 
 @requires_torch
@@ -179,7 +315,7 @@ def test_kernel_resolution_and_hashing() -> None:
         allow_torch_backend=True,
         **requested_backends,
     )
-    assert info.attention_backend in {"flash_attn_2", "torch_sdpa"}
+    assert info.attention_backend in {"flash_attn_2", "torch"}
     for name in MODULE_BACKEND_FIELDS:
         backend = getattr(info, name)
         if name in TRITON_MODULE_BACKENDS:

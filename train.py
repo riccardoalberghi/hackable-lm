@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from config import COMPARISON_MODES, DEFAULTS, MODULE_BACKEND_FIELDS, MODULE_BACKENDS, resolve_config
+from config import ATTENTION_BACKENDS, COMPARISON_MODES, DEFAULTS, MODULE_BACKEND_FIELDS, MODULE_BACKENDS, resolve_config
 from data import MemmapDataLoader, load_manifest
 from kernels import apply_precision_policy, compile_training_model, mark_compiled_step_begin, resolve_kernel_backends
 from model import LanguageModel
@@ -622,6 +622,9 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
     if args.attention_full_every is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.attention_full_every = (model_cfg.get("attention_full_every") or 0) if "attention_full_every" in model_cfg else 0
+    if args.attention_backend is None:
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        args.attention_backend = model_cfg.get("attention_backend")
     if args.global_batch_tokens is None:
         args.global_batch_tokens = cfg.get("global_batch_tokens")
     if args.device_batch_size is None:
@@ -740,6 +743,7 @@ def main() -> None:
     parser.add_argument("--sequence-len", type=int)
     parser.add_argument("--attention-window", type=int, help="local causal attention window; use 0 for full attention")
     parser.add_argument("--attention-full-every", type=int, help="make every Nth layer full attention after local layers; use 0 for no periodic full layers")
+    parser.add_argument("--attention-backend", choices=sorted(ATTENTION_BACKENDS))
     parser.add_argument("--target-param-data-ratio", type=int)
     parser.add_argument("--target-params", type=int)
     parser.add_argument("--target-tokens", type=int)
@@ -807,6 +811,7 @@ def main() -> None:
     args.sequence_len = args.sequence_len if args.sequence_len is not None else DEFAULTS["sequence_len"]
     args.attention_window = args.attention_window if args.attention_window is not None else DEFAULTS["attention_window"]
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
+    args.attention_backend = args.attention_backend if args.attention_backend is not None else DEFAULTS["attention_backend"]
     args.target_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio is not None else DEFAULTS["target_param_data_ratio"]
     for name in MODULE_BACKEND_FIELDS:
         if getattr(args, name) is None:
@@ -840,6 +845,7 @@ def main() -> None:
         sequence_len=args.sequence_len,
         attention_window=args.attention_window,
         attention_full_every=args.attention_full_every,
+        attention_backend=args.attention_backend,
         target_param_data_ratio=args.target_param_data_ratio,
         target_params=args.target_params,
         target_tokens=args.target_tokens,
@@ -883,6 +889,7 @@ def main() -> None:
         compile_model=config.compile,
         compile_mode=config.compile_mode,
         compile_capture_scalar_outputs=config.compile_capture_scalar_outputs,
+        attention_backend=config.model.attention_backend,
         **{name: getattr(config.model, name) for name in MODULE_BACKEND_FIELDS},
     ).to_dict()
     loader = MemmapDataLoader(
@@ -916,7 +923,7 @@ def main() -> None:
     require_scheduled_data(loader, config, args, start_step, validate_rank=is_main)
 
     raw_model = LanguageModel(config.model).to(device)
-    raw_model.prepare_compile_cache(config.sequence_len, device)
+    raw_model.prepare_compile_cache(config.sequence_len, device, batch_size=config.device_batch_size)
     raw_model = apply_precision_policy(raw_model, config.precision)
     optimizer = create_optimizer(raw_model, config)
     clip_params = [p for p in raw_model.parameters() if p.requires_grad]

@@ -8,6 +8,7 @@ from typing import Any
 SCALING_POLICY = "depth_simple"
 COMPARISON_MODES = {"same_depth", "same_params", "same_tokens", "same_bytes", "same_flops", "same_time"}
 MODULE_BACKENDS = {"torch", "triton"}
+ATTENTION_BACKENDS = {"torch", "flex_attention", "flash_attn_2", "flash_attn_3", "flash_attn_4"}
 MODULE_BACKEND_FIELDS = (
     "qkv_backend",
     "output_backend",
@@ -39,6 +40,7 @@ DEFAULTS = {
     "final_lr_frac": 0.1,
     "compile_mode": "max-autotune",
     "compile_capture_scalar_outputs": True,
+    "attention_backend": "flash_attn_2",
     "qkv_backend": "triton",
     "output_backend": "torch",
     "gate_up_backend": "triton",
@@ -63,6 +65,15 @@ def normalize_module_backend(name: str, backend: str) -> str:
     backend = backend.lower()
     if backend not in MODULE_BACKENDS:
         raise ValueError(f"unknown {name} {backend!r}")
+    return backend
+
+
+def normalize_attention_backend(backend: str) -> str:
+    if not isinstance(backend, str):
+        raise ValueError(f"unknown attention_backend {backend!r}")
+    backend = backend.lower()
+    if backend not in ATTENTION_BACKENDS:
+        raise ValueError(f"unknown attention_backend {backend!r}")
     return backend
 
 
@@ -214,7 +225,7 @@ class ModelConfig:
     dropout: float = 0.0
     attention_window: int | None = DEFAULTS["attention_window"]
     attention_full_every: int | None = DEFAULTS["attention_full_every"]
-    attention_backend: str = "flash_attn_2"
+    attention_backend: str = DEFAULTS["attention_backend"]
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"]
     qkv_backend: str = DEFAULTS["qkv_backend"]
     output_backend: str = DEFAULTS["output_backend"]
@@ -299,6 +310,7 @@ def resolve_config(
     compile_mode: str = DEFAULTS["compile_mode"],
     compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"],
     kernel_backend: str = "torch",
+    attention_backend: str = DEFAULTS["attention_backend"],
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"],
     qkv_backend: str = DEFAULTS["qkv_backend"],
     output_backend: str = DEFAULTS["output_backend"],
@@ -312,6 +324,7 @@ def resolve_config(
         raise ValueError(f"unknown comparison mode {comparison_mode!r}")
     attention_window = normalize_attention_window(attention_window)
     attention_full_every = normalize_attention_full_every(attention_full_every)
+    attention_backend = normalize_attention_backend(attention_backend)
     if compile_mode not in {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}:
         raise ValueError(f"unknown compile mode {compile_mode!r}")
     if kernel_backend != "torch":
@@ -413,7 +426,7 @@ def resolve_config(
         mlp_hidden=hidden,
         attention_window=attention_window,
         attention_full_every=attention_full_every,
-        attention_backend="flash_attn_2",
+        attention_backend=attention_backend,
         loss_chunk_size=loss_chunk_size,
         **module_backends,
     )

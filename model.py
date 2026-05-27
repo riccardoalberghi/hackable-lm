@@ -137,6 +137,8 @@ class AttentionCore(AcceleratedModule):
         self.dropout = config.dropout
         self._mask_cache: torch.Tensor | None = None
         self._mask_cache_seq_len = 0
+        self._flex_mask_cache = None
+        self._flex_mask_cache_key = None
 
     def _sliding_window_mask(self, seq_len: int, device: torch.device) -> torch.Tensor | None:
         window = self.attention_window
@@ -155,6 +157,14 @@ class AttentionCore(AcceleratedModule):
         if window is None or window >= seq_len:
             return None
         return window
+
+    def _flex_block_mask(self, batch_size: int, n_head: int, seq_len: int, device: torch.device):
+        window_size = self._attention_window_size(seq_len)
+        key = (batch_size, n_head, seq_len, device, window_size)
+        if self._flex_mask_cache is None or self._flex_mask_cache_key != key:
+            self._flex_mask_cache = kernels.flex_attention_block_mask(batch_size, n_head, seq_len, device, window_size)
+            self._flex_mask_cache_key = key
+        return self._flex_mask_cache
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         backend = "torch" if q.device.type == "cpu" else self.selected_backend()
@@ -185,6 +195,24 @@ class AttentionCore(AcceleratedModule):
         )
         return y.transpose(1, 2)
 
+    def fwd_flex_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        seq_len = q.shape[1]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        block_mask = self._flex_block_mask(q.shape[0], q.shape[1], seq_len, q.device)
+        y = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            self.dropout if self.training else 0.0,
+            is_causal=True,
+            block_mask=block_mask,
+            window_size=self._attention_window_size(seq_len),
+            backend="flex_attention",
+        )
+        return y.transpose(1, 2)
+
     def fwd_flash_attn_2(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return kernels.scaled_dot_product_attention(
             q,
@@ -195,6 +223,30 @@ class AttentionCore(AcceleratedModule):
             attn_mask=None,
             window_size=self._attention_window_size(q.shape[1]),
             backend="flash_attn_2",
+        )
+
+    def fwd_flash_attn_3(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            self.dropout if self.training else 0.0,
+            is_causal=True,
+            attn_mask=None,
+            window_size=self._attention_window_size(q.shape[1]),
+            backend="flash_attn_3",
+        )
+
+    def fwd_flash_attn_4(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            self.dropout if self.training else 0.0,
+            is_causal=True,
+            attn_mask=None,
+            window_size=self._attention_window_size(q.shape[1]),
+            backend="flash_attn_4",
         )
 
 
@@ -338,10 +390,18 @@ class LanguageModel(nn.Module):
             x, x_norm = block(x, x_norm)
         return self.lm_head(x_norm, targets)
 
-    def prepare_compile_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype = torch.bfloat16) -> None:
+    def prepare_compile_cache(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+        batch_size: int = 1,
+    ) -> None:
         for block in self.blocks:
             block.attn.qkv.rope(seq_len, device, dtype)
             block.attn.attention._sliding_window_mask(seq_len, device)
+            if self.config.attention_backend == "flex_attention" and device.type != "cpu":
+                block.attn.attention._flex_block_mask(batch_size, self.config.n_head, seq_len, device)
 
     def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())

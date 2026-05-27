@@ -31,7 +31,7 @@ MFU* is usually in the high 50s to low 60s, reported against the standard bf16 p
 - document-offset token memmap preprocessing
 - decoder-only causal LM in `model.py`
 - fused operator modules for QKV, residual/RMSNorm projections, SwiGLU, and LM head/loss
-- local-window attention with periodic full attention
+- local-window attention with periodic full attention and selectable attention backends
 - Muon for transformer matrices and AdamW for embeddings, head, and small params
 - strict CUDA training path in `train.py`
 - run manifests for comparing one change at a time
@@ -93,6 +93,10 @@ uv run python train.py \
   --data data/processed \
   --run-name d12
 ```
+
+Attention backend options are `flash_attn_2`, `flash_attn_3`, `flash_attn_4`,
+`flex_attention`, and `torch`. The `torch` backend is a plain matmul/softmax implementation for
+experiments and tests; it is not the default training fast path.
 
 Checkpoint evaluation is enabled by default. Pass `--eval-final-only` to
 evaluate only the final checkpoint, `--disable-benchmarks` to keep validation

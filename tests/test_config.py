@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 from config import (
+    ATTENTION_BACKENDS,
     DEFAULTS,
     MODULE_BACKEND_FIELDS,
     auto_device_batch_size,
@@ -31,6 +32,8 @@ def test_config_derivation() -> None:
     assert DEFAULTS["sequence_len"] == 2048
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
+    assert DEFAULTS["attention_backend"] == "flash_attn_2"
+    assert ATTENTION_BACKENDS == {"torch", "flex_attention", "flash_attn_2", "flash_attn_3", "flash_attn_4"}
     assert DEFAULTS["global_batch_tokens"] == 2**20
     assert DEFAULTS["lr_depth_stability_reference"] == 6
     assert DEFAULTS["qkv_backend"] == "triton"
@@ -43,6 +46,7 @@ def test_config_derivation() -> None:
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
+    assert default_cfg.model.attention_backend == DEFAULTS["attention_backend"]
     assert default_cfg.model.loss_chunk_size == DEFAULTS["loss_chunk_size"]
     for name in MODULE_BACKEND_FIELDS:
         assert getattr(default_cfg.model, name) == DEFAULTS[name]
@@ -79,6 +83,8 @@ def test_config_derivation() -> None:
     assert heuristic_loss_chunk.model.loss_chunk_size == 0
     adamw = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, optimizer="adamw")
     assert adamw.optimizer == "adamw"
+    flex = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, attention_backend="flex_attention")
+    assert flex.model.attention_backend == "flex_attention"
 
 
 def test_config_shape_and_budget_controls() -> None:
@@ -110,6 +116,12 @@ def test_config_shape_and_budget_controls() -> None:
         assert "unknown qkv_backend" in str(exc)
     else:
         raise AssertionError("unknown qkv_backend should fail")
+    try:
+        resolve_config(depth=6, vocab_size=32768, attention_backend="sdpa")
+    except ValueError as exc:
+        assert "unknown attention_backend" in str(exc)
+    else:
+        raise AssertionError("unknown attention_backend should fail")
 
 
 def test_auto_device_batch_size_uses_memory_cap() -> None:
