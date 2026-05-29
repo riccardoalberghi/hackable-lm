@@ -4,24 +4,24 @@ from pathlib import Path
 
 import pytest
 
+from config import MODULE_BACKEND_FIELDS
 from conftest import requires_cuda, requires_torch, torch
 
 
 @requires_torch
-def test_linear_cross_entropy_torch_path_matches_dense() -> None:
+def test_lm_head_torch_loss_matches_dense() -> None:
     import torch.nn.functional as F
 
     from config import resolve_config
-    from model import LinearCrossEntropyLoss
+    from model import LMHeadProjection
 
     torch.manual_seed(0)
-    cfg = resolve_config(depth=2, vocab_size=33, sequence_len=7, precision="fp32_test", compile_model=False, loss_backend="torch")
-    loss_fn = LinearCrossEntropyLoss(cfg.model)
-    weight = torch.randn(33, 16, requires_grad=True)
-    hidden = torch.randn(3, 7, 16, requires_grad=True)
+    cfg = resolve_config(depth=2, vocab_size=33, sequence_len=7, precision="fp32_test", compile_model=False, lm_head_backend="torch")
+    head = LMHeadProjection(cfg.model)
+    hidden = torch.randn(3, 7, cfg.model.n_embd, requires_grad=True)
     targets = torch.randint(0, 33, (3, 7))
-    dense = F.cross_entropy(F.linear(hidden, weight).float().reshape(-1, 33), targets.reshape(-1))
-    chunked = loss_fn(hidden, weight, None, targets)
+    dense = F.cross_entropy(F.linear(hidden, head.lm_head.weight).float().reshape(-1, 33), targets.reshape(-1))
+    _, chunked = head(hidden, targets)
     assert torch.allclose(chunked, dense, atol=1e-6)
 
 
@@ -36,7 +36,7 @@ def test_bf16_precision_policy_leaves_modules_unchanged() -> None:
 
 
 @requires_torch
-def test_swiglu_torch_fallback_matches_baseline_and_backward() -> None:
+def test_swiglu_cpu_matches_baseline_and_backward() -> None:
     import torch.nn.functional as F
 
     import kernels
@@ -95,6 +95,42 @@ def test_swiglu_triton_matches_baseline_and_backward() -> None:
 
 
 @requires_torch
+def test_torch_attention_backend_is_manual_and_matches_reference() -> None:
+    import math
+
+    import kernels
+
+    q = torch.randn(2, 3, 5, 7, requires_grad=True)
+    k = torch.randn(2, 3, 5, 7, requires_grad=True)
+    v = torch.randn(2, 3, 5, 9, requires_grad=True)
+    mask = torch.ones(5, 5, dtype=torch.bool).tril()[None, None, :, :]
+    mask = mask & ((torch.arange(5)[:, None] - torch.arange(5)[None, :]) < 3)[None, None, :, :]
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
+    ref = torch.matmul(torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1), v)
+
+    original_sdpa = kernels.F.scaled_dot_product_attention
+    kernels.F.scaled_dot_product_attention = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SDPA was called"))
+    try:
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+            attn_mask=mask,
+            backend="torch",
+        )
+    finally:
+        kernels.F.scaled_dot_product_attention = original_sdpa
+
+    assert torch.allclose(out, ref, atol=1e-6)
+    out.sum().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
+@requires_torch
 def test_flash_attention_casts_qkv_to_bfloat16() -> None:
     import kernels
 
@@ -127,21 +163,115 @@ def test_flash_attention_casts_qkv_to_bfloat16() -> None:
 
 
 @requires_torch
-def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
+def test_flash_attention_3_casts_qkv_to_bfloat16() -> None:
     import kernels
-    from config import resolve_config
-    from model import QKNormRoPE
+
+    calls = []
+
+    def fake_flash_attn(q, k, v, softmax_scale, causal, window_size):
+        calls.append((q.dtype, k.dtype, v.dtype, softmax_scale, causal, window_size))
+        return q
+
+    original_flash_attn = kernels._FLASH_ATTN_3
+    kernels._FLASH_ATTN_3 = fake_flash_attn
+    try:
+        q = torch.randn(2, 4, 3, 8, dtype=torch.float32)
+        k = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        v = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+            window_size=3,
+            backend="flash_attn_3",
+        )
+    finally:
+        kernels._FLASH_ATTN_3 = original_flash_attn
+
+    assert out.dtype == torch.bfloat16
+    assert calls == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, None, True, (2, 0))]
+
+
+@requires_torch
+def test_flash_attention_4_casts_qkv_to_bfloat16() -> None:
+    import kernels
+
+    calls = []
+
+    def fake_flash_attn(q, k, v, softmax_scale, causal, window_size):
+        calls.append((q.dtype, k.dtype, v.dtype, softmax_scale, causal, window_size))
+        return q
+
+    original_flash_attn = kernels._FLASH_ATTN_4
+    kernels._FLASH_ATTN_4 = fake_flash_attn
+    try:
+        q = torch.randn(2, 4, 3, 8, dtype=torch.float32)
+        k = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        v = torch.randn(2, 4, 1, 8, dtype=torch.float32)
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+            window_size=3,
+            backend="flash_attn_4",
+        )
+    finally:
+        kernels._FLASH_ATTN_4 = original_flash_attn
+
+    assert out.dtype == torch.bfloat16
+    assert calls == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, None, True, (2, 0))]
+
+
+@requires_torch
+def test_flex_attention_backend_dispatches_with_block_mask() -> None:
+    import kernels
+
+    calls = []
+    block_mask = object()
+
+    def fake_flex_attention(q, k, v, block_mask, scale, enable_gqa):
+        calls.append((q.shape, k.shape, v.shape, block_mask, scale, enable_gqa))
+        return q
+
+    original_flex = kernels._FLEX_ATTENTION
+    original_create_block_mask = kernels._CREATE_BLOCK_MASK
+    kernels._FLEX_ATTENTION = fake_flex_attention
+    kernels._CREATE_BLOCK_MASK = None
+    try:
+        q = torch.randn(2, 4, 3, 8)
+        k = torch.randn(2, 1, 3, 8)
+        v = torch.randn(2, 1, 3, 8)
+        out = kernels.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+            block_mask=block_mask,
+            backend="flex_attention",
+        )
+    finally:
+        kernels._FLEX_ATTENTION = original_flex
+        kernels._CREATE_BLOCK_MASK = original_create_block_mask
+
+    assert out is q
+    assert calls == [(q.shape, k.shape, v.shape, block_mask, 8**-0.5, True)]
+
+
+@requires_torch
+def test_qk_norm_rope_cpu_matches_reference_and_backward() -> None:
+    import kernels
 
     torch.manual_seed(0)
-    cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="torch")
-    qk_norm_rope = QKNormRoPE(cfg.model)
     q = torch.randn(2, 5, 3, 8, requires_grad=True)
     k = torch.randn(2, 5, 2, 8, requires_grad=True)
     freqs = torch.randn(5, 2)
     cos = torch.cat((freqs.cos(), freqs.cos()), dim=-1)[None, :, None, :]
     sin = torch.cat((freqs.sin(), freqs.sin()), dim=-1)[None, :, None, :]
-
-    q_out, k_out = qk_norm_rope(q, k, cos.transpose(1, 2), sin.transpose(1, 2))
 
     def ref(x: torch.Tensor) -> torch.Tensor:
         x_norm = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
@@ -152,11 +282,9 @@ def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
 
     q_ref = ref(q)
     k_ref = ref(k)
+    q_out, k_out = kernels.qk_norm_rope_triton(q, k, cos, sin, 1e-6)
     assert torch.allclose(q_out, q_ref, atol=1e-6)
     assert torch.allclose(k_out, k_ref, atol=1e-6)
-    q_triton_cpu, k_triton_cpu = kernels.qk_norm_rope_triton(q, k, cos, sin, 1e-6)
-    assert torch.allclose(q_triton_cpu, q_ref, atol=1e-6)
-    assert torch.allclose(k_triton_cpu, k_ref, atol=1e-6)
 
     dq = torch.randn_like(q_out)
     dk = torch.randn_like(k_out)
@@ -173,37 +301,35 @@ def test_qk_norm_rope_torch_matches_reference_and_backward() -> None:
 
 @requires_torch
 def test_kernel_resolution_and_hashing() -> None:
-    from kernels import resolve_kernel_backends
+    from kernels import TRITON_MODULE_BACKENDS, resolve_kernel_backends
     from repro import hash_directory
 
+    requested_backends = {
+        name: "triton" if name in TRITON_MODULE_BACKENDS else "torch"
+        for name in MODULE_BACKEND_FIELDS
+    }
     info = resolve_kernel_backends(
         "torch",
         "fp32_test",
         False,
-        loss_backend="triton",
         allow_torch_backend=True,
+        **requested_backends,
     )
-    assert info.actual_attention_backend in {"flash_attn_2", "torch_sdpa"}
-    assert info.actual_mlp_backend == "torch"
-    assert info.actual_loss_backend in {"triton_fused_linear_ce", "torch"}
-    assert info.actual_rope_backend == "torch"
+    assert info.attention_backend in {"flash_attn_2", "torch"}
+    for name in MODULE_BACKEND_FIELDS:
+        backend = getattr(info, name)
+        if name in TRITON_MODULE_BACKENDS:
+            assert backend in {"triton", "torch"}
+        else:
+            assert backend == "torch"
     assert isinstance(info.triton_available, bool)
-    rope_info = resolve_kernel_backends(
+    torch_info = resolve_kernel_backends(
         "torch",
         "fp32_test",
         False,
-        loss_backend="triton",
-        rope_backend="triton",
         allow_torch_backend=True,
+        **{name: "torch" for name in MODULE_BACKEND_FIELDS},
     )
-    assert rope_info.actual_loss_backend in {"triton_fused_linear_ce", "torch"}
-    assert rope_info.actual_rope_backend in {"triton", "torch"}
-    mlp_info = resolve_kernel_backends(
-        "torch",
-        "fp32_test",
-        False,
-        mlp_backend="triton",
-        allow_torch_backend=True,
-    )
-    assert mlp_info.actual_mlp_backend in {"triton_swiglu", "torch"}
+    for name in MODULE_BACKEND_FIELDS:
+        assert getattr(torch_info, name) == "torch"
     assert len(hash_directory(Path.cwd())) == 64

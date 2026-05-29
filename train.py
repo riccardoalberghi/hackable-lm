@@ -17,12 +17,12 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from config import COMPARISON_MODES, DEFAULTS, resolve_config
+from config import ATTENTION_BACKENDS, COMPARISON_MODES, DEFAULTS, MODULE_BACKEND_FIELDS, MODULE_BACKENDS, resolve_config
 from data import MemmapDataLoader, load_manifest
 from kernels import apply_precision_policy, compile_training_model, mark_compiled_step_begin, resolve_kernel_backends
 from model import LanguageModel
 from optim import create_optimizer, lr_multiplier
-from repro import compatibility_warnings, load_trusted_checkpoint, seed_everything, write_json, write_run_manifest
+from repro import load_trusted_checkpoint, seed_everything, write_json, write_run_manifest
 from tokenizer import tokenizer_manifest
 
 
@@ -553,12 +553,7 @@ def grad_global_norm(parameters: list[torch.nn.Parameter], norm_type: float = 2.
     grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
         return torch.tensor(0.0)
-    get_total_norm = getattr(torch.nn.utils, "get_total_norm", None)
-    if get_total_norm is not None:
-        return get_total_norm(grads, norm_type=norm_type, foreach=True)
-    device = grads[0].device
-    norms = torch.stack([torch.linalg.vector_norm(grad.detach(), ord=norm_type).to(device) for grad in grads])
-    return torch.linalg.vector_norm(norms, ord=norm_type)
+    return torch.nn.utils.get_total_norm(grads, norm_type=norm_type, foreach=True)
 
 
 def _start_mlflow(args, run_dir: Path, manifest: dict):
@@ -627,27 +622,25 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
     if args.attention_full_every is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.attention_full_every = (model_cfg.get("attention_full_every") or 0) if "attention_full_every" in model_cfg else 0
+    if args.attention_backend is None:
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        args.attention_backend = model_cfg.get("attention_backend")
     if args.global_batch_tokens is None:
         args.global_batch_tokens = cfg.get("global_batch_tokens")
     if args.device_batch_size is None:
         args.device_batch_size = cfg.get("device_batch_size")
-    if args.mlp_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.mlp_backend = model_cfg.get("mlp_backend")
-    if args.loss_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.loss_backend = model_cfg.get("loss_backend")
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    for name in MODULE_BACKEND_FIELDS:
+        if getattr(args, name) is None:
+            setattr(args, name, model_cfg.get(name))
     if args.loss_chunk_size is None:
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         args.loss_chunk_size = model_cfg.get("loss_chunk_size")
-    if args.rope_backend is None:
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        args.rope_backend = model_cfg.get("rope_backend")
     if args.optimizer is None:
         args.optimizer = cfg.get("optimizer")
     if args.seed is None:
         args.seed = manifest.get("seed")
-    if getattr(args, "data_shuffle_seed", None) is None:
+    if args.data_shuffle_seed is None:
         args.data_shuffle_seed = _nested(manifest, "data", "data_shuffle_seed")
     if args.target_param_data_ratio is None:
         args.target_param_data_ratio = cfg.get("target_param_data_ratio")
@@ -672,52 +665,6 @@ def apply_match_run_defaults(args, manifest: dict) -> None:
             args.target_seconds = cfg.get("target_time_seconds")
         if args.tokens_per_second is None:
             args.tokens_per_second = cfg.get("tokens_per_second")
-
-
-WARMDOWN_ALLOWED_RESUME_MISMATCH_FIELDS = {
-    "lr_schedule",
-    "config.target_tokens",
-    "config.target_bytes",
-    "config.train_flops_budget",
-    "config.target_time_seconds",
-}
-
-
-def _warning_field(warning: str) -> str | None:
-    if not warning.endswith(")"):
-        return None
-    marker = " ("
-    if marker not in warning:
-        return None
-    return warning.rsplit(marker, 1)[1][:-1]
-
-
-def _lr_schedule_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    schedule = manifest.get("lr_schedule") or {}
-    config = manifest.get("config") or {}
-    return {
-        "scheduler": schedule.get("scheduler", config.get("lr_scheduler")),
-        "warmdown_ratio": schedule.get("warmdown_ratio", config.get("warmdown_ratio")),
-        "final_lr_frac": schedule.get("final_lr_frac", config.get("final_lr_frac")),
-    }
-
-
-def warmdown_compatibility_warnings(source_manifest: dict[str, Any], target_manifest: dict[str, Any]) -> list[str]:
-    warnings = []
-    for warning in compatibility_warnings(source_manifest, target_manifest):
-        field = _warning_field(warning)
-        if field in WARMDOWN_ALLOWED_RESUME_MISMATCH_FIELDS:
-            continue
-        if warning.startswith("comparison mode differs"):
-            continue
-        warnings.append(warning)
-
-    source_schedule = _lr_schedule_from_manifest(source_manifest)
-    target_schedule = _lr_schedule_from_manifest(target_manifest)
-    for field in ("scheduler", "warmdown_ratio", "final_lr_frac"):
-        if source_schedule.get(field) != target_schedule.get(field):
-            warnings.append(f"LR {field.replace('_', ' ')} differs for warmdown resume")
-    return warnings
 
 
 def checkpoint_data_loader_state(loader: MemmapDataLoader, ddp: dict[str, int | bool]) -> dict[str, Any] | None:
@@ -796,6 +743,7 @@ def main() -> None:
     parser.add_argument("--sequence-len", type=int)
     parser.add_argument("--attention-window", type=int, help="local causal attention window; use 0 for full attention")
     parser.add_argument("--attention-full-every", type=int, help="make every Nth layer full attention after local layers; use 0 for no periodic full layers")
+    parser.add_argument("--attention-backend", choices=sorted(ATTENTION_BACKENDS))
     parser.add_argument("--target-param-data-ratio", type=int)
     parser.add_argument("--target-params", type=int)
     parser.add_argument("--target-tokens", type=int)
@@ -824,7 +772,6 @@ def main() -> None:
         type=int,
         help="with --resume, continue to this total training-step budget using that target run's WSD warmdown boundary",
     )
-    parser.add_argument("--allow-resume-mismatch", action="store_true", help="resume even if checkpoint provenance differs from requested run settings")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--val-batches", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
@@ -833,10 +780,9 @@ def main() -> None:
     parser.add_argument("--eval-final-only", action="store_true", help="run checkpoint validation and benchmarks only for the final checkpoint")
     parser.add_argument("--max-grad-norm", type=float, default=0.0, help="clip gradients to this norm; set <= 0 to disable clipping")
     parser.add_argument("--precision", default="bf16", choices=["bf16"])
-    parser.add_argument("--mlp-backend", choices=["torch", "triton"])
-    parser.add_argument("--loss-backend", choices=["torch", "triton"])
+    for name in MODULE_BACKEND_FIELDS:
+        parser.add_argument(f"--{name.replace('_', '-')}", choices=sorted(MODULE_BACKENDS))
     parser.add_argument("--loss-chunk-size", type=int, help="token rows per linear CE chunk; use 0 for the built-in heuristic")
-    parser.add_argument("--rope-backend", choices=["torch", "triton"])
     parser.add_argument("--optimizer", choices=["muon_adamw", "adamw"])
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-mode", default=DEFAULTS["compile_mode"], choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
@@ -865,13 +811,14 @@ def main() -> None:
     args.sequence_len = args.sequence_len if args.sequence_len is not None else DEFAULTS["sequence_len"]
     args.attention_window = args.attention_window if args.attention_window is not None else DEFAULTS["attention_window"]
     args.attention_full_every = args.attention_full_every if args.attention_full_every is not None else DEFAULTS["attention_full_every"]
+    args.attention_backend = args.attention_backend if args.attention_backend is not None else DEFAULTS["attention_backend"]
     args.target_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio is not None else DEFAULTS["target_param_data_ratio"]
-    args.mlp_backend = args.mlp_backend if args.mlp_backend is not None else DEFAULTS["mlp_backend"]
-    args.loss_backend = args.loss_backend if args.loss_backend is not None else DEFAULTS["loss_backend"]
+    for name in MODULE_BACKEND_FIELDS:
+        if getattr(args, name) is None:
+            setattr(args, name, DEFAULTS[name])
     args.loss_chunk_size = args.loss_chunk_size if args.loss_chunk_size is not None else DEFAULTS["loss_chunk_size"]
     if args.loss_chunk_size < 0:
         parser.error("--loss-chunk-size must be >= 0")
-    args.rope_backend = args.rope_backend if args.rope_backend is not None else DEFAULTS["rope_backend"]
     args.optimizer = args.optimizer if args.optimizer is not None else DEFAULTS["optimizer"]
     if args.peak_flops is not None and args.peak_flops <= 0:
         parser.error("--peak-flops must be > 0")
@@ -898,6 +845,7 @@ def main() -> None:
         sequence_len=args.sequence_len,
         attention_window=args.attention_window,
         attention_full_every=args.attention_full_every,
+        attention_backend=args.attention_backend,
         target_param_data_ratio=args.target_param_data_ratio,
         target_params=args.target_params,
         target_tokens=args.target_tokens,
@@ -915,12 +863,10 @@ def main() -> None:
         compile_mode=args.compile_mode,
         compile_capture_scalar_outputs=not args.no_compile_capture_scalar_outputs,
         kernel_backend="torch",
-        mlp_backend=args.mlp_backend,
-        loss_backend=args.loss_backend,
         loss_chunk_size=args.loss_chunk_size,
-        rope_backend=args.rope_backend,
         optimizer=args.optimizer,
         comparison_mode=args.comparison_mode,
+        **{name: getattr(args, name) for name in MODULE_BACKEND_FIELDS},
     )
     if ddp["enabled"]:
         total_grad_accum = config.gradient_accumulation_steps
@@ -943,9 +889,8 @@ def main() -> None:
         compile_model=config.compile,
         compile_mode=config.compile_mode,
         compile_capture_scalar_outputs=config.compile_capture_scalar_outputs,
-        loss_backend=config.model.loss_backend,
-        rope_backend=config.model.rope_backend,
-        mlp_backend=config.model.mlp_backend,
+        attention_backend=config.model.attention_backend,
+        **{name: getattr(config.model, name) for name in MODULE_BACKEND_FIELDS},
     ).to_dict()
     loader = MemmapDataLoader(
         args.data,
@@ -978,7 +923,7 @@ def main() -> None:
     require_scheduled_data(loader, config, args, start_step, validate_rank=is_main)
 
     raw_model = LanguageModel(config.model).to(device)
-    raw_model.prepare_compile_cache(config.sequence_len, device)
+    raw_model.prepare_compile_cache(config.sequence_len, device, batch_size=config.device_batch_size)
     raw_model = apply_precision_policy(raw_model, config.precision)
     optimizer = create_optimizer(raw_model, config)
     clip_params = [p for p in raw_model.parameters() if p.requires_grad]
@@ -1010,21 +955,6 @@ def main() -> None:
         ckpt = resume_ckpt
         if ckpt is None:
             raise RuntimeError("resume checkpoint was not loaded")
-        resume_manifest = ckpt.get("run_manifest")
-        if resume_manifest:
-            resume_warnings = (
-                warmdown_compatibility_warnings(resume_manifest, manifest)
-                if has_warmdown_resume_target(args)
-                else compatibility_warnings(resume_manifest, manifest)
-            )
-            if resume_warnings and not args.allow_resume_mismatch:
-                formatted = "\n".join(f"- {warning}" for warning in resume_warnings)
-                resume_kind = "warmdown resume checkpoint" if has_warmdown_resume_target(args) else "checkpoint"
-                raise RuntimeError(
-                    f"{resume_kind} provenance does not match requested resume settings:\n"
-                    f"{formatted}\n"
-                    "Pass --allow-resume-mismatch only for an intentional non-paper resume."
-                )
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         restore_rng_state(ckpt["rng_state"])

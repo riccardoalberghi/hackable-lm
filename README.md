@@ -30,8 +30,8 @@ MFU* is usually in the high 50s to low 60s, reported against the standard bf16 p
 - `hackablebpe` Rust byte-level BPE tokenizer trainer, encoder, and decoder
 - document-offset token memmap preprocessing
 - decoder-only causal LM in `model.py`
-- RoPE, RMSNorm, QK norm, SwiGLU MLPs, fused QKV and fused gate/up projections
-- local-window attention with periodic full attention
+- fused operator modules for QKV, residual/RMSNorm projections, SwiGLU, and LM head/loss
+- local-window attention with periodic full attention and selectable attention backends
 - Muon for transformer matrices and AdamW for embeddings, head, and small params
 - strict CUDA training path in `train.py`
 - run manifests for comparing one change at a time
@@ -94,6 +94,10 @@ uv run python train.py \
   --run-name d12
 ```
 
+Attention backend options are `flash_attn_2`, `flash_attn_3`, `flash_attn_4`,
+`flex_attention`, and `torch`. The `torch` backend is a plain matmul/softmax implementation for
+experiments and tests; it is not the default training fast path.
+
 Checkpoint evaluation is enabled by default. Pass `--eval-final-only` to
 evaluate only the final checkpoint, `--disable-benchmarks` to keep validation
 BPB only, or `--disable-eval` to skip both validation and benchmarks.
@@ -111,11 +115,7 @@ The intended workflow is boring on purpose:
 1. Run a baseline.
 2. Make one local change.
 3. Run the candidate.
-4. Compare the manifests and metrics.
-
-For fair comparisons, keep the boring fields aligned: data hashes, tokenizer
-hash, split seed, data shuffle seed, sequence length, global batch tokens,
-optimizer grouping, precision, kernel backend, scaling policy, and seed.
+4. Compare the run metrics, manifests, and saved configs.
 
 When a candidate should inherit the baseline budget, use `--match-run`:
 
@@ -126,11 +126,6 @@ uv run python train.py \
   --data data/processed \
   --candidate-label idea_x \
   --run-name idea_x_same_tokens
-
-uv run python repro.py compare \
-  runs/d12/manifest.json \
-  runs/idea_x_same_tokens/manifest.json \
-  --fail-on-warning
 ```
 
 `same_depth` is good for a first pass. Use `same_params` when the change alters
@@ -167,8 +162,8 @@ uv run python train.py \
 The checkpoint must resume at or before the target budget's WSD decay start; if
 the requested target would have started warmdown before the checkpoint, training
 exits with an error. The run ends at the requested total step or
-tokens-per-scaling-param budget, restores the data-loader cursor, and rejects
-unexpected provenance mismatches without needing `--allow-resume-mismatch`.
+tokens-per-scaling-param budget, restores the data-loader cursor, and requires
+the checkpoint model config to match the requested model config.
 
 ## Eval
 

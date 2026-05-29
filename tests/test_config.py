@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 
 from config import (
+    ATTENTION_BACKENDS,
     DEFAULTS,
+    MODULE_BACKEND_FIELDS,
     auto_device_batch_size,
     config_from_dict,
     depth_dimensions,
@@ -30,20 +32,24 @@ def test_config_derivation() -> None:
     assert DEFAULTS["sequence_len"] == 2048
     assert DEFAULTS["attention_window"] == 512
     assert DEFAULTS["attention_full_every"] == 4
+    assert DEFAULTS["attention_backend"] == "flash_attn_2"
+    assert ATTENTION_BACKENDS == {"torch", "flex_attention", "flash_attn_2", "flash_attn_3", "flash_attn_4"}
     assert DEFAULTS["global_batch_tokens"] == 2**20
     assert DEFAULTS["lr_depth_stability_reference"] == 6
-    assert DEFAULTS["mlp_backend"] == "triton"
-    assert DEFAULTS["loss_backend"] == "triton"
-    assert DEFAULTS["rope_backend"] == "triton"
+    assert DEFAULTS["qkv_backend"] == "triton"
+    assert DEFAULTS["output_backend"] == "torch"
+    assert DEFAULTS["gate_up_backend"] == "triton"
+    assert DEFAULTS["down_backend"] == "torch"
+    assert DEFAULTS["lm_head_backend"] == "triton"
     assert DEFAULTS["optimizer"] == "muon_adamw"
     default_cfg = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False)
     assert default_cfg.sequence_len == 2048
     assert default_cfg.model.attention_window == 512
     assert default_cfg.model.attention_full_every == 4
-    assert default_cfg.model.mlp_backend == "triton"
-    assert default_cfg.model.loss_backend == "triton"
+    assert default_cfg.model.attention_backend == DEFAULTS["attention_backend"]
     assert default_cfg.model.loss_chunk_size == DEFAULTS["loss_chunk_size"]
-    assert default_cfg.model.rope_backend == "triton"
+    for name in MODULE_BACKEND_FIELDS:
+        assert getattr(default_cfg.model, name) == DEFAULTS[name]
     pattern = [layer_attention_window(i, 8, 512, 4) for i in range(8)]
     assert pattern == [512, 512, 512, None, 512, 512, 512, None]
     short_pattern = [layer_attention_window(i, 3, 512, 4) for i in range(3)]
@@ -55,31 +61,30 @@ def test_config_derivation() -> None:
     assert cfg.budget_policy == "param_data_ratio"
     assert cfg.gradient_accumulation_steps >= 1
     assert config_from_dict(cfg.to_dict()).model.n_embd == cfg.model.n_embd
-    old_style = cfg.to_dict()
-    old_style["model"].pop("attention_window")
-    assert config_from_dict(old_style).model.attention_window is None
-    hybrid_style = cfg.to_dict()
-    hybrid_style["model"].pop("attention_full_every")
-    assert config_from_dict(hybrid_style).model.attention_full_every is None
-    legacy_style = cfg.to_dict()
-    legacy_style["model"].pop("loss_backend")
-    assert config_from_dict(legacy_style).model.loss_backend == DEFAULTS["loss_backend"]
-    legacy_mlp_backend = cfg.to_dict()
-    legacy_mlp_backend["model"].pop("mlp_backend")
-    assert config_from_dict(legacy_mlp_backend).model.mlp_backend == DEFAULTS["mlp_backend"]
-    stale_mlp_style = cfg.to_dict()
-    stale_mlp_style["model"]["mlp_activation"] = "legacy"
-    assert not hasattr(config_from_dict(stale_mlp_style).model, "mlp_activation")
-    torch_mlp = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, mlp_backend="torch")
-    assert torch_mlp.model.mlp_backend == "torch"
-    triton_rope = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, rope_backend="triton")
-    assert triton_rope.model.rope_backend == "triton"
+    mixed_backend_values = {
+        "qkv_backend": "torch",
+        "output_backend": "torch",
+        "gate_up_backend": "triton",
+        "down_backend": "torch",
+        "lm_head_backend": "triton",
+    }
+    mixed_ops = resolve_config(
+        depth=2,
+        vocab_size=128,
+        precision="fp32_test",
+        compile_model=False,
+        **mixed_backend_values,
+    )
+    for name, backend in mixed_backend_values.items():
+        assert getattr(mixed_ops.model, name) == backend
     custom_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=8192)
     assert custom_loss_chunk.model.loss_chunk_size == 8192
     heuristic_loss_chunk = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, loss_chunk_size=0)
     assert heuristic_loss_chunk.model.loss_chunk_size == 0
     adamw = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, optimizer="adamw")
     assert adamw.optimizer == "adamw"
+    flex = resolve_config(depth=2, vocab_size=128, precision="fp32_test", compile_model=False, attention_backend="flex_attention")
+    assert flex.model.attention_backend == "flex_attention"
 
 
 def test_config_shape_and_budget_controls() -> None:
@@ -106,11 +111,17 @@ def test_config_shape_and_budget_controls() -> None:
     else:
         raise AssertionError("negative loss_chunk_size should fail")
     try:
-        resolve_config(depth=6, vocab_size=32768, mlp_backend="cuda")
+        resolve_config(depth=6, vocab_size=32768, qkv_backend="cuda")
     except ValueError as exc:
-        assert "unknown MLP backend" in str(exc)
+        assert "unknown qkv_backend" in str(exc)
     else:
-        raise AssertionError("unknown mlp_backend should fail")
+        raise AssertionError("unknown qkv_backend should fail")
+    try:
+        resolve_config(depth=6, vocab_size=32768, attention_backend="sdpa")
+    except ValueError as exc:
+        assert "unknown attention_backend" in str(exc)
+    else:
+        raise AssertionError("unknown attention_backend should fail")
 
 
 def test_auto_device_batch_size_uses_memory_cap() -> None:

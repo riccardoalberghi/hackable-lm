@@ -7,6 +7,15 @@ from typing import Any
 
 SCALING_POLICY = "depth_simple"
 COMPARISON_MODES = {"same_depth", "same_params", "same_tokens", "same_bytes", "same_flops", "same_time"}
+MODULE_BACKENDS = {"torch", "triton"}
+ATTENTION_BACKENDS = {"torch", "flex_attention", "flash_attn_2", "flash_attn_3", "flash_attn_4"}
+MODULE_BACKEND_FIELDS = (
+    "qkv_backend",
+    "output_backend",
+    "gate_up_backend",
+    "down_backend",
+    "lm_head_backend",
+)
 
 DEFAULTS = {
     "head_dim": 128,
@@ -31,9 +40,12 @@ DEFAULTS = {
     "final_lr_frac": 0.1,
     "compile_mode": "max-autotune",
     "compile_capture_scalar_outputs": True,
-    "mlp_backend": "triton",
-    "loss_backend": "triton",
-    "rope_backend": "triton",
+    "attention_backend": "flash_attn_2",
+    "qkv_backend": "triton",
+    "output_backend": "torch",
+    "gate_up_backend": "triton",
+    "down_backend": "torch",
+    "lm_head_backend": "triton",
     "loss_chunk_size": 4096,
 }
 
@@ -47,14 +59,22 @@ def ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def round_up(x: int, multiple: int) -> int:
-    return ceil_div(x, multiple) * multiple
+def normalize_module_backend(name: str, backend: str) -> str:
+    if not isinstance(backend, str):
+        raise ValueError(f"unknown {name} {backend!r}")
+    backend = backend.lower()
+    if backend not in MODULE_BACKENDS:
+        raise ValueError(f"unknown {name} {backend!r}")
+    return backend
 
 
-def _pow2_floor(x: float) -> int:
-    if x <= 1:
-        return 1
-    return 2 ** int(math.floor(math.log2(x)))
+def normalize_attention_backend(backend: str) -> str:
+    if not isinstance(backend, str):
+        raise ValueError(f"unknown attention_backend {backend!r}")
+    backend = backend.lower()
+    if backend not in ATTENTION_BACKENDS:
+        raise ValueError(f"unknown attention_backend {backend!r}")
+    return backend
 
 
 def depth_dimensions(depth: int, head_dim: int = DEFAULTS["head_dim"], layers_per_head: int = DEFAULTS["layers_per_head"]) -> tuple[int, int]:
@@ -117,13 +137,14 @@ def auto_device_batch_size(
         return 1
 
     estimated_batch = available_gib / per_sample_gib
-    memory_cap = _pow2_floor(estimated_batch)
+    memory_cap = 1 if estimated_batch <= 1 else 2 ** int(math.floor(math.log2(estimated_batch)))
 
     return max(1, min(fair_batch_cap, memory_cap))
 
 
 def mlp_hidden_dim(n_embd: int) -> int:
-    return round_up(ceil_div(8 * n_embd, 3), 256)
+    hidden = ceil_div(8 * n_embd, 3)
+    return ceil_div(hidden, 256) * 256
 
 
 def scaling_params_for_depth(
@@ -188,7 +209,7 @@ def estimate_flops_per_token(
 
 @dataclass
 class ModelConfig:
-    """Decoder-only baseline: RoPE, pre-norm RMSNorm, QK norm, SwiGLU MLP, untied head."""
+    """Decoder-only baseline: RoPE, pre-norm RMSNorm, QK norm, SwiGLU MLP."""
 
     vocab_size: int
     block_size: int
@@ -202,15 +223,15 @@ class ModelConfig:
     rope_fraction: float = 0.25
     norm_eps: float = 1e-6
     dropout: float = 0.0
-    tie_embeddings: bool = False
-    qk_norm: bool = True
     attention_window: int | None = DEFAULTS["attention_window"]
     attention_full_every: int | None = DEFAULTS["attention_full_every"]
-    attention_backend: str = "flash_attn_2"
-    mlp_backend: str = DEFAULTS["mlp_backend"]
-    loss_backend: str = DEFAULTS["loss_backend"]
+    attention_backend: str = DEFAULTS["attention_backend"]
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"]
-    rope_backend: str = DEFAULTS["rope_backend"]
+    qkv_backend: str = DEFAULTS["qkv_backend"]
+    output_backend: str = DEFAULTS["output_backend"]
+    gate_up_backend: str = DEFAULTS["gate_up_backend"]
+    down_backend: str = DEFAULTS["down_backend"]
+    lm_head_backend: str = DEFAULTS["lm_head_backend"]
 
 
 @dataclass
@@ -289,10 +310,13 @@ def resolve_config(
     compile_mode: str = DEFAULTS["compile_mode"],
     compile_capture_scalar_outputs: bool = DEFAULTS["compile_capture_scalar_outputs"],
     kernel_backend: str = "torch",
-    mlp_backend: str = DEFAULTS["mlp_backend"],
-    loss_backend: str = DEFAULTS["loss_backend"],
+    attention_backend: str = DEFAULTS["attention_backend"],
     loss_chunk_size: int | None = DEFAULTS["loss_chunk_size"],
-    rope_backend: str = DEFAULTS["rope_backend"],
+    qkv_backend: str = DEFAULTS["qkv_backend"],
+    output_backend: str = DEFAULTS["output_backend"],
+    gate_up_backend: str = DEFAULTS["gate_up_backend"],
+    down_backend: str = DEFAULTS["down_backend"],
+    lm_head_backend: str = DEFAULTS["lm_head_backend"],
     optimizer: str = DEFAULTS["optimizer"],
     comparison_mode: str = "same_depth",
 ) -> ResolvedConfig:
@@ -300,18 +324,24 @@ def resolve_config(
         raise ValueError(f"unknown comparison mode {comparison_mode!r}")
     attention_window = normalize_attention_window(attention_window)
     attention_full_every = normalize_attention_full_every(attention_full_every)
+    attention_backend = normalize_attention_backend(attention_backend)
     if compile_mode not in {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}:
         raise ValueError(f"unknown compile mode {compile_mode!r}")
     if kernel_backend != "torch":
         raise ValueError(f"unknown kernel backend {kernel_backend!r}")
-    if mlp_backend not in {"torch", "triton"}:
-        raise ValueError(f"unknown MLP backend {mlp_backend!r}")
-    if loss_backend not in {"torch", "triton"}:
-        raise ValueError(f"unknown loss backend {loss_backend!r}")
+    requested_module_backends = {
+        "qkv_backend": qkv_backend,
+        "output_backend": output_backend,
+        "gate_up_backend": gate_up_backend,
+        "down_backend": down_backend,
+        "lm_head_backend": lm_head_backend,
+    }
+    module_backends = {
+        name: normalize_module_backend(name, requested_module_backends[name])
+        for name in MODULE_BACKEND_FIELDS
+    }
     if loss_chunk_size is not None and loss_chunk_size < 0:
         raise ValueError(f"loss_chunk_size must be nonnegative, got {loss_chunk_size}")
-    if rope_backend not in {"torch", "triton"}:
-        raise ValueError(f"unknown RoPE backend {rope_backend!r}")
     if optimizer not in {"muon_adamw", "adamw"}:
         raise ValueError(f"unknown optimizer {optimizer!r}")
     budget_overrides = [num_iterations, target_tokens, target_bytes, target_flops, target_time_seconds]
@@ -396,11 +426,9 @@ def resolve_config(
         mlp_hidden=hidden,
         attention_window=attention_window,
         attention_full_every=attention_full_every,
-        attention_backend="flash_attn_2",
-        mlp_backend=mlp_backend,
-        loss_backend=loss_backend,
-        rope_backend=rope_backend,
+        attention_backend=attention_backend,
         loss_chunk_size=loss_chunk_size,
+        **module_backends,
     )
 
     return ResolvedConfig(
@@ -462,34 +490,5 @@ def resolve_config(
 
 def config_from_dict(obj: dict[str, Any]) -> ResolvedConfig:
     data = dict(obj)
-    data.pop("D_REF", None)
-    data.pop("B_REF", None)
-    data.pop("reference_depth", None)
-    data.pop("reference_batch_tokens", None)
-    data.pop("predicted_batch_tokens", None)
-    data.pop("dmodel_lr_scale", None)
-    data.setdefault("lr_scheduler", DEFAULTS["lr_scheduler"])
-    data.setdefault("optimizer", DEFAULTS["optimizer"])
-    data.setdefault("total_gradient_accumulation_steps", data["gradient_accumulation_steps"])
-    data.setdefault("world_size", 1)
-    model_data = dict(data["model"])
-    if "attention_window" not in model_data:
-        model_data["attention_window"] = None
-    if "attention_full_every" not in model_data:
-        model_data["attention_full_every"] = None
-    model_data.setdefault("rope_fraction", 0.25)
-    model_data.pop("mlp_activation", None)
-    model_data.setdefault("mlp_backend", DEFAULTS["mlp_backend"])
-    if model_data.get("mlp_backend") not in {"torch", "triton"}:
-        model_data["mlp_backend"] = DEFAULTS["mlp_backend"]
-    model_data.setdefault("loss_backend", DEFAULTS["loss_backend"])
-    if model_data.get("loss_backend") not in {"torch", "triton"}:
-        model_data["loss_backend"] = DEFAULTS["loss_backend"]
-    if model_data.get("rope_backend") not in {"torch", "triton"}:
-        model_data["rope_backend"] = DEFAULTS["rope_backend"]
-    model_data.setdefault("loss_chunk_size", DEFAULTS["loss_chunk_size"])
-    model_data["attention_window"] = normalize_attention_window(model_data["attention_window"])
-    model_data["attention_full_every"] = normalize_attention_full_every(model_data["attention_full_every"])
-    data["kernel_backend"] = "torch"
-    data["model"] = ModelConfig(**model_data)
+    data["model"] = ModelConfig(**dict(data["model"]))
     return ResolvedConfig(**data)

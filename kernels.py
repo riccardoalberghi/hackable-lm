@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+from config import MODULE_BACKEND_FIELDS, MODULE_BACKENDS, normalize_attention_backend
 
 try:
     import triton
@@ -18,15 +21,20 @@ except ModuleNotFoundError:
 @dataclass
 class KernelInfo:
     requested_backend: str
-    actual_attention_backend: str
-    actual_mlp_backend: str
-    actual_loss_backend: str
-    actual_rope_backend: str
+    attention_backend: str
+    qkv_backend: str
+    output_backend: str
+    gate_up_backend: str
+    down_backend: str
+    lm_head_backend: str
     torch_compile: bool
     torch_compile_mode: str
     torch_compile_capture_scalar_outputs: bool
     precision: str
     flash_attn_available: bool
+    flash_attn_3_available: bool
+    flash_attn_4_available: bool
+    flex_attention_available: bool
     triton_available: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -34,6 +42,15 @@ class KernelInfo:
 
 
 _FLASH_ATTN = None
+_FLASH_ATTN_3 = None
+_FLASH_ATTN_4 = None
+_FLEX_ATTENTION = None
+_CREATE_BLOCK_MASK = None
+TRITON_MODULE_BACKENDS = frozenset({
+    "qkv_backend",
+    "gate_up_backend",
+    "lm_head_backend",
+})
 
 
 def triton_available() -> bool:
@@ -61,10 +78,49 @@ def _import_flash_attn():
     return flash_attn_func
 
 
-def configure_torch_compile(capture_scalar_outputs: bool) -> None:
-    import torch._dynamo
+def _import_flash_attn_3():
+    global _FLASH_ATTN_3
+    if _FLASH_ATTN_3 is not None:
+        return None if _FLASH_ATTN_3 is False else _FLASH_ATTN_3
+    if importlib.util.find_spec("flash_attn_interface") is None:
+        _FLASH_ATTN_3 = False
+        return None
+    from flash_attn_interface import flash_attn_func
 
-    torch._dynamo.config.capture_scalar_outputs = capture_scalar_outputs
+    _FLASH_ATTN_3 = flash_attn_func
+    return flash_attn_func
+
+
+def _import_flash_attn_4():
+    global _FLASH_ATTN_4
+    if _FLASH_ATTN_4 is not None:
+        return None if _FLASH_ATTN_4 is False else _FLASH_ATTN_4
+    try:
+        if importlib.util.find_spec("flash_attn.cute") is None:
+            _FLASH_ATTN_4 = False
+            return None
+        from flash_attn.cute import flash_attn_func
+    except ModuleNotFoundError:
+        _FLASH_ATTN_4 = False
+        return None
+
+    _FLASH_ATTN_4 = flash_attn_func
+    return flash_attn_func
+
+
+def _import_flex_attention():
+    global _FLEX_ATTENTION, _CREATE_BLOCK_MASK
+    if _FLEX_ATTENTION is not None:
+        return None if _FLEX_ATTENTION is False else (_FLEX_ATTENTION, _CREATE_BLOCK_MASK)
+    if importlib.util.find_spec("torch.nn.attention.flex_attention") is None:
+        _FLEX_ATTENTION = False
+        _CREATE_BLOCK_MASK = False
+        return None
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    _FLEX_ATTENTION = flex_attention
+    _CREATE_BLOCK_MASK = create_block_mask
+    return flex_attention, create_block_mask
 
 
 def compile_training_model(
@@ -75,7 +131,9 @@ def compile_training_model(
 ) -> torch.nn.Module:
     if not enabled:
         return model
-    configure_torch_compile(capture_scalar_outputs)
+    import torch._dynamo
+
+    torch._dynamo.config.capture_scalar_outputs = capture_scalar_outputs
     return torch.compile(model, mode=None if mode == "default" else mode, dynamic=False, fullgraph=True)
 
 
@@ -91,61 +149,95 @@ def resolve_kernel_backends(
     compile_model: bool,
     compile_mode: str = "default",
     compile_capture_scalar_outputs: bool = True,
-    loss_backend: str = "torch",
-    rope_backend: str = "torch",
+    attention_backend: str = "flash_attn_2",
     allow_torch_backend: bool = False,
-    *,
-    mlp_backend: str = "torch",
+    **module_backends: str,
 ) -> KernelInfo:
     requested = requested.lower()
     if requested != "torch":
         raise ValueError(f"unknown kernel backend {requested!r}")
-    mlp_backend = mlp_backend.lower()
-    if mlp_backend not in {"torch", "triton"}:
-        raise ValueError(f"unknown MLP backend {mlp_backend!r}")
-    loss_backend = loss_backend.lower()
-    if loss_backend not in {"torch", "triton"}:
-        raise ValueError(f"unknown loss backend {loss_backend!r}")
-    rope_backend = rope_backend.lower()
-    if rope_backend not in {"torch", "triton"}:
-        raise ValueError(f"unknown RoPE backend {rope_backend!r}")
+    unknown_module_backends = set(module_backends) - set(MODULE_BACKEND_FIELDS)
+    if unknown_module_backends:
+        raise ValueError(f"unknown module backend fields {sorted(unknown_module_backends)!r}")
+    requested_module_backends = {}
+    for name in MODULE_BACKEND_FIELDS:
+        value = module_backends.get(name, "torch")
+        if not isinstance(value, str):
+            raise ValueError(f"unknown {name} {value!r}")
+        backend = value.lower()
+        if backend not in MODULE_BACKENDS:
+            raise ValueError(f"unknown {name} {backend!r}")
+        requested_module_backends[name] = backend
+    requested_attention_backend = normalize_attention_backend(attention_backend)
     flash_attn = _import_flash_attn()
+    flash_attn_3 = _import_flash_attn_3()
+    flash_attn_4 = _import_flash_attn_4()
+    flex_attention = _import_flex_attention()
     has_triton = triton_available()
-    if not flash_attn and not allow_torch_backend:
+    if requested_attention_backend == "flash_attn_2" and not flash_attn and not allow_torch_backend:
         raise RuntimeError(
             "FlashAttention 2 is required for the training fast path. "
             "Run `uv sync --locked` in the CUDA environment."
         )
+    if requested_attention_backend == "flash_attn_3" and not flash_attn_3 and not allow_torch_backend:
+        raise RuntimeError(
+            "FlashAttention 3 is required for attention_backend=flash_attn_3. "
+            "Install the Hopper FlashAttention package in the CUDA environment."
+        )
+    if requested_attention_backend == "flash_attn_4" and not flash_attn_4 and not allow_torch_backend:
+        raise RuntimeError(
+            "FlashAttention 4 is required for attention_backend=flash_attn_4. "
+            "Install flash-attn-4 in the CUDA environment."
+        )
+    if requested_attention_backend == "flex_attention" and not flex_attention and not allow_torch_backend:
+        raise RuntimeError("PyTorch FlexAttention is required for attention_backend=flex_attention.")
     if precision != "bf16" and not allow_torch_backend:
         raise RuntimeError(
             f"unsupported precision mode {precision!r}; the training fast path uses bf16"
         )
-    if mlp_backend == "triton" and not has_triton and not allow_torch_backend:
+    unsupported_triton = [
+        name
+        for name, backend in requested_module_backends.items()
+        if backend == "triton" and name not in TRITON_MODULE_BACKENDS
+    ]
+    if unsupported_triton:
+        raise ValueError(f"triton has no implementation for module backend fields {unsupported_triton}")
+    if any(backend == "triton" for backend in requested_module_backends.values()) and not has_triton and not allow_torch_backend:
         raise RuntimeError(
-            "mlp_backend=triton requires Triton. "
+            "triton module backends require Triton. "
             "Run `uv sync --locked` in the CUDA environment."
         )
-    if loss_backend == "triton" and not has_triton and not allow_torch_backend:
-        raise RuntimeError(
-            "loss_backend=triton requires Triton. "
-            "Run `uv sync --locked` in the CUDA environment."
-        )
-    if rope_backend == "triton" and not has_triton and not allow_torch_backend:
-        raise RuntimeError(
-            "rope_backend=triton requires Triton. "
-            "Run `uv sync --locked` in the CUDA environment."
-        )
+
+    def resolved_backend(name: str) -> str:
+        backend = requested_module_backends[name]
+        if backend == "triton":
+            return "triton" if has_triton else "torch"
+        return backend
+
+    resolved_module_backends = {
+        name: resolved_backend(name)
+        for name in MODULE_BACKEND_FIELDS
+    }
+    resolved_attention_backend = requested_attention_backend
+    if (
+        (requested_attention_backend == "flash_attn_2" and not flash_attn)
+        or (requested_attention_backend == "flash_attn_3" and not flash_attn_3)
+        or (requested_attention_backend == "flash_attn_4" and not flash_attn_4)
+        or (requested_attention_backend == "flex_attention" and not flex_attention)
+    ):
+        resolved_attention_backend = "torch"
     return KernelInfo(
         requested_backend=requested,
-        actual_attention_backend="flash_attn_2" if flash_attn else "torch_sdpa",
-        actual_mlp_backend="triton_swiglu" if mlp_backend == "triton" and has_triton else "torch",
-        actual_loss_backend="triton_fused_linear_ce" if loss_backend == "triton" and has_triton else "torch",
-        actual_rope_backend="triton" if rope_backend == "triton" and has_triton else "torch",
+        attention_backend=resolved_attention_backend,
+        **resolved_module_backends,
         torch_compile=compile_model,
         torch_compile_mode=compile_mode,
         torch_compile_capture_scalar_outputs=compile_capture_scalar_outputs,
         precision=precision,
         flash_attn_available=bool(flash_attn),
+        flash_attn_3_available=bool(flash_attn_3),
+        flash_attn_4_available=bool(flash_attn_4),
+        flex_attention_available=bool(flex_attention),
         triton_available=has_triton,
     )
 
@@ -153,11 +245,6 @@ def resolve_kernel_backends(
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
     y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
     return y if weight is None else y * weight
-
-
-def _swiglu_torch(gate_up: torch.Tensor) -> torch.Tensor:
-    gate, up = gate_up.chunk(2, dim=-1)
-    return F.silu(gate) * up
 
 
 if triton is not None:
@@ -589,21 +676,6 @@ def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -
     return torch.cat((x1 * cos_half - x2 * sin_half, x2 * cos_half + x1 * sin_half, x_pass), dim=-1)
 
 
-def _qk_norm_rope_torch(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if cos.ndim == 4 and cos.shape[1] != q.shape[1] and cos.shape[2] == q.shape[1]:
-        cos = cos.transpose(1, 2)
-        sin = sin.transpose(1, 2)
-    q_normed = rms_norm(q, None, eps)
-    k_normed = rms_norm(k, None, eps)
-    return _apply_partial_rope(q_normed, cos, sin), _apply_partial_rope(k_normed, cos, sin)
-
-
 def _qk_norm_rope_setup(ctx, inputs, output) -> None:
     q, k, cos, sin, eps = inputs
     ctx.save_for_backward(q, k, cos, sin)
@@ -675,9 +747,10 @@ def swiglu_triton(gate_up: torch.Tensor) -> torch.Tensor:
     if hidden > _SWIGLU_MAX_BLOCK_SIZE:
         raise RuntimeError(f"SwiGLU hidden dimension {hidden} exceeds Triton kernel limit {_SWIGLU_MAX_BLOCK_SIZE}")
     if gate_up.is_cuda:
-        _require_triton("mlp_backend=triton")
+        _require_triton("gate_up_backend=triton")
         return _triton_swiglu(gate_up.contiguous())
-    return _swiglu_torch(gate_up)
+    gate, up = gate_up.chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 def qk_norm_rope_triton(
@@ -688,9 +761,14 @@ def qk_norm_rope_triton(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if q.is_cuda:
-        _require_triton("rope_backend=triton")
+        _require_triton("qkv_backend=triton")
         return _triton_qk_norm_rope(q, k, cos, sin, eps)
-    return _qk_norm_rope_torch(q, k, cos, sin, eps)
+    if cos.ndim == 4 and cos.shape[1] != q.shape[1] and cos.shape[2] == q.shape[1]:
+        cos = cos.transpose(1, 2)
+        sin = sin.transpose(1, 2)
+    q_normed = rms_norm(q, None, eps)
+    k_normed = rms_norm(k, None, eps)
+    return _apply_partial_rope(q_normed, cos, sin), _apply_partial_rope(k_normed, cos, sin)
 
 
 def scaled_dot_product_attention(
@@ -700,38 +778,101 @@ def scaled_dot_product_attention(
     dropout_p: float,
     is_causal: bool = True,
     attn_mask: torch.Tensor | None = None,
+    block_mask: Any | None = None,
     window_size: int | None = None,
     backend: str = "flash_attn_2",
 ) -> torch.Tensor:
     if backend == "torch":
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
-    if backend != "flash_attn_2":
-        raise RuntimeError(f"unsupported attention backend {backend!r}; the training fast path requires flash_attn_2")
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if is_causal:
+            q_len, kv_len = q.shape[-2], k.shape[-2]
+            causal_mask = torch.ones((q_len, kv_len), device=q.device, dtype=torch.bool).tril()
+            attn = attn.masked_fill(~causal_mask, float("-inf"))
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                attn = attn.masked_fill(~attn_mask, float("-inf"))
+            else:
+                attn = attn + attn_mask
+        attn = torch.softmax(attn.float(), dim=-1).to(dtype=q.dtype)
+        if dropout_p:
+            attn = F.dropout(attn, p=dropout_p, training=True)
+        return torch.matmul(attn, v)
+    if backend == "flex_attention":
+        if dropout_p:
+            raise RuntimeError("flex_attention backend does not support dropout")
+        imported = _import_flex_attention()
+        if imported is None:
+            raise RuntimeError("PyTorch FlexAttention is required for attention_backend=flex_attention.")
+        flex_attention, _ = imported
+        return flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=1.0 / math.sqrt(q.shape[-1]),
+            enable_gqa=q.shape[1] != k.shape[1],
+        )
+    if backend not in {"flash_attn_2", "flash_attn_3", "flash_attn_4"}:
+        raise RuntimeError(f"unsupported attention backend {backend!r}")
     if attn_mask is not None:
-        raise RuntimeError("flash_attn_2 path expects window_size instead of an explicit attention mask")
-    flash_attn_func = _import_flash_attn()
+        raise RuntimeError(f"{backend} path expects window_size instead of an explicit attention mask")
+    if backend == "flash_attn_2":
+        flash_attn_func = _import_flash_attn()
+    elif backend == "flash_attn_3":
+        flash_attn_func = _import_flash_attn_3()
+    else:
+        flash_attn_func = _import_flash_attn_4()
     if flash_attn_func is None:
+        label = {
+            "flash_attn_2": "FlashAttention 2",
+            "flash_attn_3": "FlashAttention 3",
+            "flash_attn_4": "FlashAttention 4",
+        }[backend]
         raise RuntimeError(
-            "FlashAttention 2 is required for attention. "
-            "Run `uv sync --locked` in the CUDA environment."
+            f"{label} is required for attention_backend={backend}. "
+            "Install it in the CUDA environment."
         )
     q = q.bfloat16()
     k = k.bfloat16()
     v = v.bfloat16()
     flash_window = (-1, -1) if window_size is None else (window_size - 1, 0)
-    return flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal, window_size=flash_window)
+    if backend == "flash_attn_2":
+        return flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal, window_size=flash_window)
+    if dropout_p:
+        raise RuntimeError(f"{backend} backend does not support dropout")
+    if backend == "flash_attn_3":
+        return flash_attn_func(q, k, v, softmax_scale=None, causal=is_causal, window_size=flash_window)
+    cute_window = (None, None) if window_size is None else (window_size - 1, 0)
+    return flash_attn_func(q, k, v, softmax_scale=None, causal=is_causal, window_size=cute_window)
+
+
+def flex_attention_block_mask(
+    batch_size: int,
+    n_head: int,
+    seq_len: int,
+    device: torch.device,
+    window_size: int | None = None,
+):
+    imported = _import_flex_attention()
+    if imported is None:
+        raise RuntimeError("PyTorch FlexAttention is required for attention_backend=flex_attention.")
+    _, create_block_mask = imported
+
+    if window_size is None:
+        def mask_mod(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+    else:
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (q_idx - kv_idx < window_size)
+
+    return create_block_mask(mask_mod, batch_size, n_head, seq_len, seq_len, device=device)
 
 
 def _scale_saved_grad(grad: torch.Tensor | None, scale: torch.Tensor) -> torch.Tensor | None:
     if grad is None:
         return None
     return grad * scale.to(dtype=grad.dtype)
-
-
-def _linear_ce_heuristic_chunk_size(n_tokens: int, hidden_size: int, vocab_size: int) -> int:
-    inc_factor = triton.cdiv(vocab_size, hidden_size)
-    chunk_size = triton.next_power_of_2(triton.cdiv(n_tokens, inc_factor))
-    return min(n_tokens, max(chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
 
 
 class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
@@ -744,7 +885,7 @@ class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
         bias: torch.Tensor | None,
         requested_chunk_size: int | None,
     ) -> torch.Tensor:
-        _require_triton("loss_backend=triton")
+        _require_triton("lm_head_backend=triton")
         if requested_chunk_size is not None and requested_chunk_size < 0:
             raise RuntimeError(f"loss_chunk_size must be nonnegative, got {requested_chunk_size}")
         hidden = hidden.contiguous()
@@ -755,7 +896,9 @@ class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
         if requested_chunk_size:
             chunk_size = min(n_tokens, max(requested_chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
         else:
-            chunk_size = _linear_ce_heuristic_chunk_size(n_tokens, hidden_size, vocab_size)
+            inc_factor = triton.cdiv(vocab_size, hidden_size)
+            chunk_size = triton.next_power_of_2(triton.cdiv(n_tokens, inc_factor))
+            chunk_size = min(n_tokens, max(chunk_size, _LINEAR_CE_MIN_CHUNK_SIZE))
         num_chunks = triton.cdiv(n_tokens, chunk_size)
 
         grad_hidden = torch.empty_like(hidden)
@@ -799,18 +942,6 @@ class _TritonFusedLinearCrossEntropy(torch.autograd.Function):
         )
 
 
-def _triton_fused_linear_cross_entropy(
-    weight: torch.Tensor,
-    hidden: torch.Tensor,
-    targets: torch.Tensor,
-    bias: torch.Tensor | None,
-    chunk_size: int | None,
-) -> torch.Tensor:
-    if not hidden.is_cuda:
-        return F.cross_entropy(F.linear(hidden, weight, bias).float(), targets)
-    return _TritonFusedLinearCrossEntropy.apply(hidden, weight, targets, bias, chunk_size)
-
-
 def fused_linear_cross_entropy_with_weight(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -822,7 +953,9 @@ def fused_linear_cross_entropy_with_weight(
     hidden_flat = hidden.reshape(-1, hidden.size(-1))
     targets_flat = targets.reshape(-1).contiguous()
     if backend == "triton":
-        return _triton_fused_linear_cross_entropy(weight, hidden_flat, targets_flat, bias, chunk_size)
+        if not hidden_flat.is_cuda:
+            return F.cross_entropy(F.linear(hidden_flat, weight, bias).float(), targets_flat)
+        return _TritonFusedLinearCrossEntropy.apply(hidden_flat, weight, targets_flat, bias, chunk_size)
     raise RuntimeError(f"unsupported fused linear cross entropy backend {backend!r}")
 
 

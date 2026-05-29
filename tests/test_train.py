@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import copy
-
 import pytest
 
 from conftest import requires_torch
@@ -214,31 +212,6 @@ def test_apply_warmdown_resume_target_updates_total_budget() -> None:
 
     with pytest.raises(ValueError, match="after the resumed checkpoint"):
         apply_warmdown_resume_target(Config(), start_step=40, args=StepArgs)
-
-
-@requires_torch
-def test_warmdown_compatibility_allows_budget_and_schedule_length_changes() -> None:
-    from train import warmdown_compatibility_warnings
-
-    source = {
-        "config": {"sequence_len": 8, "global_batch_tokens": 16, "scaling_policy": "p", "precision": "bf16", "target_tokens": 1600},
-        "lr_schedule": {"scheduler": "wsd", "warmup_steps": 5, "warmdown_ratio": 0.3, "final_lr_frac": 0.1},
-        "seed": 1,
-        "data": {"data_shuffle_seed": 7, "manifest": {"tokenizer_hash": "a", "raw_input_sha256": {"x": "1"}}},
-    }
-    target = copy.deepcopy(source)
-    target["config"]["target_tokens"] = 800
-    target["lr_schedule"]["warmup_steps"] = 3
-
-    assert warmdown_compatibility_warnings(source, target) == []
-
-    changed_seed = copy.deepcopy(target)
-    changed_seed["seed"] = 2
-    assert warmdown_compatibility_warnings(source, changed_seed) == ["seed differs (seed)"]
-
-    changed_schedule = copy.deepcopy(target)
-    changed_schedule["lr_schedule"]["final_lr_frac"] = 0.2
-    assert "LR final lr frac differs for warmdown resume" in warmdown_compatibility_warnings(source, changed_schedule)
 
 
 @requires_torch
