@@ -383,6 +383,7 @@ def run_benchmark_suites(
                 model=harness,
                 tasks=suite.tasks,
                 num_fewshot=suite.num_fewshot,
+                bootstrap_iters=0,
             )
             for suite in STANDARD_EVAL_SUITES
         }
